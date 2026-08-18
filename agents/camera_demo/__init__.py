@@ -1,10 +1,11 @@
-"""相机数据获取演示: 订阅头部与左右手末端 RGB/深度相机, 打印最新帧信息。"""
+"""相机数据获取演示: 订阅头部与左右手末端 RGB/深度相机, 打印并保存最新帧。"""
 
+import os
 import time
 
 import numpy as np
 
-from drivers.camera import CameraHub
+from drivers.camera import CameraHub, save_frame
 
 from . import config
 
@@ -25,6 +26,7 @@ def run():
         time.sleep(0.2)
 
     frames = hub.get_all()
+    os.makedirs(config.SAVE_DIR, exist_ok=True)
     print("=" * 70)
     for name in config.CAMERAS:
         frame = frames.get(name)
@@ -36,15 +38,26 @@ def run():
         print(f"  encoding={frame['encoding']}  shape={arr.shape}  dtype={arr.dtype}")
         print(f"  frame_id={frame['frame_id']}  stamp={frame['stamp']:.3f}")
         if arr.dtype == np.float32 and arr.ndim == 2:
-            print(
-                f"  深度 min={arr.min():.3f}m max={arr.max():.3f}m "
-                f"mean={arr.mean():.3f}m"
-            )
+            valid = arr[np.isfinite(arr)]
+            if valid.size:
+                print(
+                    f"  深度 min={valid.min():.3f}m max={valid.max():.3f}m "
+                    f"mean={valid.mean():.3f}m "
+                    f"(有效像素 {valid.size}/{arr.size})"
+                )
+            else:
+                print("  深度 无有效测量(全部 inf/nan)")
         elif arr.ndim == 3:
             print(
                 f"  像素均值 R={arr[..., 0].mean():.1f} "
                 f"G={arr[..., 1].mean():.1f} B={arr[..., 2].mean():.1f}"
             )
+        path = os.path.join(config.SAVE_DIR, f"{name}.png")
+        try:
+            save_frame(frame, path)
+            print(f"  已保存: {path}")
+        except Exception as e:
+            print(f"  保存失败: {e}")
     print("=" * 70)
 
     result = hub.get_all()   # 最新帧快照, 供编程复用

@@ -45,6 +45,42 @@ def image_to_numpy(msg) -> np.ndarray:
     return np.frombuffer(msg.data, dtype=np.uint8)
 
 
+def save_frame(frame, path):
+    """把一帧(dict, 即 CameraHub.get_frame 的返回)保存为图片文件。
+
+    - RGB 图 (uint8, HxWx3): 直接保存为 PNG 彩色图
+    - 深度图 (float32, HxW): 归一化到 0~255 保存为灰度 PNG, 无效值(inf/nan)置 0
+    返回实际保存的文件路径。
+    """
+    from PIL import Image
+
+    arr = frame["array"]
+    if arr.ndim == 3 and arr.dtype == np.uint8:
+        if arr.shape[2] == 3:
+            Image.fromarray(arr, "RGB").save(path)
+        elif arr.shape[2] == 4:
+            Image.fromarray(arr, "RGBA").save(path)
+        elif arr.shape[2] == 1:
+            Image.fromarray(arr[..., 0], "L").save(path)
+        else:
+            raise ValueError(f"不支持的通道数: {arr.shape[2]}")
+    elif arr.ndim == 2 and arr.dtype == np.float32:
+        valid = np.isfinite(arr)
+        vmin = float(arr[valid].min()) if valid.any() else 0.0
+        vmax = float(arr[valid].max()) if valid.any() else 1.0
+        if vmax > vmin:
+            norm = (arr - vmin) / (vmax - vmin)
+        else:
+            norm = np.zeros_like(arr)
+        norm = np.clip(norm, 0.0, 1.0)
+        norm[~valid] = 0.0
+        gray = (norm * 255.0).astype(np.uint8)
+        Image.fromarray(gray, "L").save(path)
+    else:
+        raise ValueError(f"不支持的帧格式: dtype={arr.dtype} ndim={arr.ndim}")
+    return path
+
+
 class CameraHub:
     """订阅多路相机 topic, 缓存每路最新帧。"""
 

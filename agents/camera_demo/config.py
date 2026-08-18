@@ -12,3 +12,6 @@ CAMERAS = {
 
 # 等待首帧的最长时间(秒)
 WAIT_TIMEOUT = 20.0
+
+# 保存帧图片的目录(相对工作区根目录)
+SAVE_DIR = "camera_frames"
