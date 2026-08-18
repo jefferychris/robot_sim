@@ -30,4 +30,6 @@
     4. 在 agent 里:               from drivers import MyCamera
 """
 
-__all__: list[str] = []
+from .camera import CameraHub
+
+__all__: list[str] = ["CameraHub"]
