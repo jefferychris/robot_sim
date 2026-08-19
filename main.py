@@ -26,7 +26,11 @@ import sys
 
 
 # 平台无参启动时运行的 agent —— 换 agent 就改这里(本地调试也可用命令行参数覆盖)。
-DEFAULT_AGENT = "camera_demo"
+# 当前默认 nut_picker:用头部相机识别 3 个螺母,左臂抓取放进 3 格箱子。
+# 回退到相机演示:改成 "camera_demo"。
+# 回退到纯硬件演示:改成 "arm_hand_demo"。
+# 框架示例:改成 "example_agent"。
+DEFAULT_AGENT = "nut_picker"
 
 
 def main():

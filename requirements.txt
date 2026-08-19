@@ -10,3 +10,4 @@ requests
 rabo_robocap        # 机器人控制 SDK (机械臂/底盘/夹爪)
 numpy               # 相机图像/深度数组处理
 Pillow              # 图像保存为 PNG (RGB/深度灰度图)
+opencv-python-headless>=4.8   # nut_picker 规则识别螺母/箱子(headless 适配容器无 GUI)
