@@ -18,22 +18,66 @@ NUT_PICKER_DRY_RUN=1 python main.py
 
 ### 1. 相机内参(`HEAD_CAMERA_INTRINSICS`)
 
-当前是占位 `{fx=615, fy=615, cx=320, cy=180}`,实际内参需要从 `/camera_info` 取:
+当前值(标定得出,占位 → 见下方的「标定流程」重新求解):
+
+```python
+HEAD_CAMERA_INTRINSICS = {
+    "fx": 589.47,
+    "fy": 407.37,
+    "cx": 320.00,  # depth 宽度 640 的一半(主点近似中心)
+    "cy": 180.00,  # depth 高度 360 的一半
+}
+```
+
+也可直接从 `/camera_info` 取:
 
 ```bash
-# 在平台启动场景、head 相机可见后:
 ros2 topic list | grep camera_info
-ros2 topic echo <camera_info_topic> --once
+ros2 topic echo <topic> --once
 ```
 
 拿到 `K[0,0]/K[1,1]/K[0,2]/K[1,2]` 后填回 `config.py`。
 
 ### 2. head→base 4×4 变换(`HEAD_TO_BASE_T`)
 
-当前是单位矩阵(假设相机帧≈base 帧)。如果头部相机与机器人 base 不在同一点,需要:
+当前值(标定得出)。在 nut 位置误差最大 87mm,平均 57mm。
 
-- 跑平台手眼标定,得到 4×4 齐次矩阵填入 `config.py`;或
-- 维持单位矩阵,在 `__init__.run()` 里给 GRASP_HEIGHT_M 加一个 Z 偏移补偿
+### 标定流程(新场景/换相机时重做)
+
+#### 步骤 1:平台侧保存 raw depth
+```bash
+SAVE_DEPTH_NPY=1 python main.py camera_demo
+```
+产物:
+- `camera_frames/head_rgb.png`(1920×1080,或 saved 后 960×540)
+- `camera_frames/head_depth_raw.npy`(原始 float32,米数)
+
+#### 步骤 2:从平台 API 拿 ground truth
+至少 4 个点(3 螺母 + 1 箱),每个含 `name` + `xyz` + `rgb_uv`。`rgb_uv` 是
+原始 RGB 像素坐标(1920×1080),脚本会自动缩到 saved 图坐标系。
+
+```json
+[
+  {"name": "nutA", "xyz": [-0.2286, -0.0999, 0.2815], "rgb_uv": [1087, 700]},
+  {"name": "nutB", "xyz": [-0.3413, -0.1710, 0.2806], "rgb_uv": [1340, 793]},
+  {"name": "nutC", "xyz": [-0.2975, -0.0527, 0.2868], "rgb_uv": [1168, 581]},
+  {"name": "box",  "xyz": [-0.3104,  0.2586, 0.2996], "rgb_uv": [331, 505]}
+]
+```
+
+#### 步骤 3:跑标定
+```bash
+python -m agents.nut_picker.calibrate \
+    --gt-json gt.json \
+    --depth-raw-path camera_frames/head_depth_raw.npy \
+    --rgb-coord-system raw \
+    --print-config
+```
+
+输出 `HEAD_CAMERA_INTRINSICS` + `HEAD_TO_BASE_T`,贴回 `config.py`。
+
+**注意**:此标定**不能**用 saved PNG depth(已归一化丢失米数),必须用 raw .npy。
+若没有 raw .npy,可加 `--depth-near-m 0.55 --depth-far-m 0.85` 临时凑合用(精度差)。
 
 ### 3. 螺母识别(`NUT_HSV_*` + `FRAME_INNER_PADDING`)
 
@@ -149,9 +193,11 @@ head_rgb + head_depth
 ```
 nut_picker/
 ├── __init__.py    # run() 编排入口
-├── config.py      # 全部可调常量 + TODO
+├── config.py      # 全部可调常量 + 标定后的 K / head→base
 ├── detector.py    # OpenCV 规则识别(nuts/box)
 ├── geometry.py    # 像素→base 坐标变换
 ├── motion.py      # PickPlaceRunner:pick/place/home + 重试
+├── calibrate.py   # 用 GT + raw depth 标定 K + head→base 的脚本
+├── debug_detect.py # 离线调试图(无需 ROS)
 └── README.md      # 本文件
 ```

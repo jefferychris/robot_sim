@@ -93,23 +93,38 @@ MIN_BOX_AREA_PX = 5000
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  几何 (像素→base 坐标,需标定)
+#  几何 (像素→base 坐标)
 # ══════════════════════════════════════════════════════════════════════
-# TODO(calibrate): 把下面四个值替换为真实相机内参。
-# 简单获取方式(平台启动后):
-#   ros2 topic list | grep camera_info
-#   ros2 topic echo <topic> --once
-# 取 K[0,0]/K[1,1]/K[0,2]/K[1,2] 即可。下面是占位近似值。
+# 相机内参 + head→base 4×4 来自 calibrate.py 标定结果
+# (用 4 个 GT 点(3 螺母 + 箱)+ saved head_depth.png + saved head_rgb.png)。
+#
+# 精度(nut 误差):最大 87mm,平均 57mm。
+# cell 误差:cell0 6mm,cell1/2 因箱 yaw=1.57 不在 GT 中心而大(用户说忽略 yaw)。
+#
+# 重新标定流程(后续场景/相机换了都重做一次):
+#   1. 平台侧跑 camera_demo,带环境变量保存 raw depth:
+#        SAVE_DEPTH_NPY=1 python main.py camera_demo
+#      → 产物: camera_frames/head_depth_raw.npy(float32, 米数)
+#   2. 平台 API 拿到 4+ 个 GT(世界坐标)
+#   3. 写 gt.json(name + xyz + rgb_uv),跑:
+#        python -m agents.nut_picker.calibrate \
+#          --gt-json gt.json --depth-raw-path camera_frames/head_depth_raw.npy \
+#          --print-config
+#      → 打印新的 K + T,贴回本文件。
+
 HEAD_CAMERA_INTRINSICS = {
-    "fx": 615.0,
-    "fy": 615.0,
-    "cx": 320.0,    # depth 宽度 640 的一半
-    "cy": 180.0,    # depth 高度 360 的一半
+    "fx": 589.47,    # 标定得出
+    "fy": 407.37,    # 标定得出
+    "cx": 320.00,    # depth 宽度 640 的一半(主点近似在中心)
+    "cy": 180.00,    # depth 高度 360 的一半
 }
 
-# TODO(calibrate): 把单位矩阵替换为 head_camera_frame→base_link 的 4×4 齐次变换。
-# 建议:跑平台手眼标定;或者近似 head 与 base 同原点(误差由 grasp_height 容差吸收)。
-HEAD_TO_BASE_T = np.eye(4, dtype=np.float64)
+HEAD_TO_BASE_T = np.array([
+    [ 0.35569388, -0.82761364,  0.43420908, -0.54462108],
+    [-0.93456917, -0.31104024,  0.17272645, -0.11249490],
+    [-0.00789427, -0.46723617, -0.88409731,  0.91460053],
+    [ 0.0,         0.0,         0.0,         1.0],
+], dtype=np.float64)
 
 # 深度图无效或缺失时,假设螺母/格子离桌面这么高(米)。
 TABLE_Z_FALLBACK_M = 0.02

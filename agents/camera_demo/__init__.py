@@ -27,6 +27,7 @@ def run():
 
     frames = hub.get_all()
     os.makedirs(config.SAVE_DIR, exist_ok=True)
+    save_raw_depth = os.getenv("SAVE_DEPTH_NPY", "0") == "1"
     print("=" * 70)
     for name in config.CAMERAS:
         frame = frames.get(name)
@@ -58,6 +59,11 @@ def run():
             print(f"  已保存: {path}")
         except Exception as e:
             print(f"  保存失败: {e}")
+        # 保存原始深度为 .npy(标定用),默认关闭
+        if save_raw_depth and arr.dtype == np.float32 and arr.ndim == 2:
+            npy_path = os.path.join(config.SAVE_DIR, f"{name}_raw.npy")
+            np.save(npy_path, arr)
+            print(f"  原始深度已保存: {npy_path}")
     print("=" * 70)
 
     result = hub.get_all()   # 最新帧快照, 供编程复用
