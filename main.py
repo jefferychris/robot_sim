@@ -30,7 +30,7 @@ import sys
 # 回退到相机演示:改成 "camera_demo"。
 # 回退到纯硬件演示:改成 "arm_hand_demo"。
 # 框架示例:改成 "example_agent"。
-DEFAULT_AGENT = "arm_hand_demo"
+DEFAULT_AGENT = "nut_picker"
 
 
 def main():
