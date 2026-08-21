@@ -45,10 +45,14 @@ HAND_MODE = "sim"
 #
 # 2026-08-20 raw depth 标定后,nut Z ≈ 0.28m(原 PNG 路径 0.17m 是凑出来的)。
 # APPROACH_HEIGHT_M=0.15 会让 approach Z=0.43,超出 LinkerArmA7 工作空间,
-# 报 out_of_workspace。降到 0.05 让 approach Z=0.33 在工作空间内。
-APPROACH_HEIGHT_M = 0.05
-GRASP_HEIGHT_M    = 0.015    # TODO(tune): 首次 sim 后看实际抓取位置调整
-PLACE_HEIGHT_M    = 0.02     # TODO(tune): 首次 sim 后看实际 cell 底面调整
+# 报 out_of_workspace。先降到 0.05 让 approach Z=0.33 落在工作空间边界,
+# 但实际 nut Z 跑到 0.28-0.29m,approach Z=0.33-0.34 还是超工作空间
+# (2026-08-21 实测 3 个螺母 pick 全部 out_of_workspace)。
+# 再降到 0.02 → approach Z=0.30-0.31,应能进工作空间。
+APPROACH_HEIGHT_M = 0.0     # 2026-08-21 实测:depth Z ≈ 0.28m,工作空间上限 ~0.28-0.29
+                            # → APPROACH/GRASP/PLACE 全 0(没有安全缓冲,见底直接抓)
+GRASP_HEIGHT_M    = 0.0
+PLACE_HEIGHT_M    = 0.0
 
 # 抓取姿态:默认俯视(roll=0, pitch=π, yaw=0)
 GRIPPER_ROLL  = 0.0
@@ -105,6 +109,23 @@ MIN_BOX_AREA_PX = 5000
 # 精度(nut 误差):最大 87mm,平均 57mm。
 # cell 误差:cell0 6mm,cell1/2 因箱 yaw=1.57 不在 GT 中心而大(用户说忽略 yaw)。
 #
+# ─────────────────────────────────────────────────────────────────────
+#  2026-08-21 双模式对照(agents/position_validation/validate_scene_intrinsics.py)
+# ─────────────────────────────────────────────────────────────────────
+# 场景给的 intrinsics(假设方像素 fx=fy=554.3)替换本 K 后:
+#
+#   Mode A (scene K + calibrated T):  mean=80.7mm  ← 退化 17mm
+#   Mode B (scene K + scene T):       mean=973.9mm ← obzg_33≠base_link
+#   Mode R (calibrated K + T,本文件): mean=63.0mm  ← ★ 当前最优
+#
+# 结论:calibrated 非方像素 K (fx=657, fy=862) 比「h_fov 推方像素 K」更准。
+# 本文件的 K + T 就是 Mode R,验证已通过。
+#
+# 同时由 scene T_cam_obzg + calibrated T_cam_base 反推出 obzg_33 → base_link:
+#   position = [-0.8349, -0.1037, +0.8945]
+#   RPY(deg) = [-124.52, +32.23, -39.98]
+# → obzg_33 不是 base_link(在 base_link 左前上方 89cm,带显著旋转)。
+#
 # 重新标定流程(后续场景/相机换了都重做一次):
 #   1. 平台侧跑 camera_demo,带环境变量保存 raw depth:
 #        SAVE_DEPTH_NPY=1 python main.py camera_demo
@@ -117,8 +138,8 @@ MIN_BOX_AREA_PX = 5000
 #      → 打印新的 K + T,贴回本文件。
 
 HEAD_CAMERA_INTRINSICS = {
-    "fx": 656.84,    # 标定得出(raw depth 路径,2026-08-20)
-    "fy": 862.11,    # 标定得出(raw depth 路径,2026-08-20)
+    "fx": 656.84,    # 标定得出(raw depth 路径,2026-08-20) → Mode R 验证最优
+    "fy": 862.11,    # 标定得出(raw depth 路径,2026-08-20) → 非方像素,scene K 方像素假设反而退化
     "cx": 320.00,    # depth 宽度 640 的一半(主点近似在中心)
     "cy": 180.00,    # depth 高度 360 的一半
 }

@@ -1,8 +1,23 @@
 {
   "camera": {
-    "name": "head_rgb",
-    "position": [-0.0, -0.0, 0.882],
-    "orientation_rpy": [1.571, -0.398, 1.571]
+    "name": "head_depth (dcam_obzg_33)",
+    "intrinsics": {
+      "fx": 554.3,
+      "fy": 554.3,
+      "cx": 320.0,
+      "cy": 180.0,
+      "resolution": [640, 360],
+      "h_fov_rad": 1.047,
+      "near_m": 0.1,
+      "far_m": 10.0,
+      "source": "derived from h_fov=1.047rad & W=640 H=360, square-pixel pinhole assumption"
+    },
+    "mount_pose": {
+      "frame": "obzg_33",
+      "xyz": [0.05, 0.0, -0.03],
+      "rpy": [0.0, 0.8, 0.0],
+      "source": "Gazebo scene, camera-to-mount-link local pose"
+    }
   },
   "objects": [
     {"name": "nut_big",    "kind": "nut", "xyz": [-0.2286, -0.0999, 0.2815]},

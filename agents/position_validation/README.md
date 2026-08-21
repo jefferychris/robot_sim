@@ -76,11 +76,12 @@ RGB 上画每个对象的中心十字 + 误差数字 + 顶部摘要条。
 
 ```
 position_validation/
-├── __init__.py          # run() 入口:相机 → 检测 → 比对 → 日志/overlay
-├── config.py            # 复用 nut_picker 的 K/T/CAMERAS + 场景参数文件路径
-├── validation.py        # load_scene_params / run_validation / summarize / log_results
-├── validation_offline.py # 离线版:读 saved RGB + raw depth 重算(显式区分 RGB/depth)
-└── README.md            # 本文件
+├── __init__.py              # run() 入口:相机 → 检测 → 比对 → 日志/overlay
+├── config.py                # 复用 nut_picker 的 K/T/CAMERAS + 场景参数文件路径
+├── validation.py            # load_scene_params / run_validation / summarize / log_results
+├── validation_offline.py    # 离线版:读 saved RGB + raw depth 重算
+├── validate_scene_intrinsics.py  # 双模式:scene K vs calibrated K,对照 scene GT
+└── README.md                # 本文件
 ```
 
 ## 离线重算(`validation_offline.py`)
@@ -102,15 +103,95 @@ python -m agents.position_validation.validation_offline \
 ```
 
 **关键**:位置(3D XYZ)从 raw depth `.npy`(float32 米数)反投影得到,**不是** head_depth.png(归一化 0-255 已丢米数)。
-RGB PNG 只用来定位「目标在哪一个像素」,**不参与** 3D 计算。日志会显式标出:
+RGB PNG 只用来定位「目标在哪一个像素」,**不参与** 3D 计算。
+
+## 场景 intrinsics 验证(`validate_scene_intrinsics.py`)
+
+回答:**「场景真值」推出来的 fx/fy 跟 calibrate.py 标定出来的 K,哪个误差更小?**
+
+calibrate.py 算的 `HEAD_CAMERA_INTRINSICS={fx:656.84, fy:862.11}` 是非方像素;
+按场景假设 `fx=fy=(W/2)/tan(h_fov/2)=554.3` 是方像素。两者都对不上,所以跑两组对照:
+
+| Mode | K 来源 | T 来源 | 含义 |
+|---|---|---|---|
+| **A** | scene intrinsics (fx=fy=554.3) | calibrated HEAD_TO_BASE_T | 只换 K,看 intrinsic 误差占多少 |
+| **B** | scene intrinsics | scene camera mount pose(假设 obzg_33==base_link) | 全用场景,看假设对不对 |
+| **C** | scene intrinsics | 重建 T_cam_base = T_obzg_base @ T_cam_obzg | 推导 obzg_33→base_link 后重建 T,自检 ≡ Mode A |
+| **R(ref)** | calibrated K | calibrated T | 现有 pipeline,作为 baseline |
+
+```bash
+python -m agents.position_validation.validate_scene_intrinsics
+```
+
+实测结果(基于 `camera_frames/` saved files + 当前 scene JSON):
 
 ```
-[load] RGB ← camera_frames/head_rgb.png  shape=(540, 960, 3) dtype=uint8(仅用于找目标像素)
-[load] raw depth ← camera_frames/head_depth_raw.npy  shape=(360, 640) dtype=float32(用于 3D 反投影)
-...
-  → RGB 只用来找目标像素,不参与 3D 计算
-  → raw depth 提供 z 值(米)→ 针孔反投影 → head→base T → base_link XYZ
-...
-# --verbose-flow 多打一行:
-  nut_big: rgb_px=(544,350)  depth_px=(362.3,233.3)  depth=0.7855m  base=(-0.305,-0.067,0.284)
+        target    Mode A (scn K+cal T)        Mode B (scn K+T)        Mode R (cal K+T)
+       nut_big                 96.9 mm                921.5 mm                 83.6 mm
+    nut_medium                 44.5 mm               1104.2 mm                 27.1 mm
+     nut_small                 69.2 mm               1019.9 mm                 58.1 mm
+         box                112.2 mm                850.2 mm                 83.4 mm
 ```
+
+结论:
+- **Mode A vs Mode R**:scene K 平均 80.7mm,calibrated K 平均 63.0mm —— **calibrated K 反而更准 17mm**,
+  说明 "fx=fy=554.3 (方像素假设)" 不是最优,calibrate.py 算的 `fx=657, fy=862` 才接近真实传感器
+- **Mode B 误差 ~900mm**:`obzg_33` 不是 `base_link`(这是预期,见下方派生)
+- **派生**:由 calibrated T 和 scene T 反推 `T_obzg_base = T_cam_base @ inv(T_cam_obzg)`
+  ```
+  T_obzg_base:
+    position  = [-0.8349, -0.1037, +0.8945]
+    RPY(deg)  = [-124.52, +32.23, -39.98]
+  ```
+  obzg_33 实际位于 base_link 左前方上方 89cm 处,带显著旋转
+- **Mode A ≡ Mode C**(误差差 = 0 mm):确认 `T_cam_base = T_obzg_base @ T_cam_obzg` 自洽
+
+## 场景参数 JSON 格式
+
+```json
+{
+  "camera": {
+    "name": "head_depth (dcam_obzg_33)",
+    "intrinsics": {
+      "fx": 554.3, "fy": 554.3, "cx": 320.0, "cy": 180.0,
+      "resolution": [640, 360], "h_fov_rad": 1.047,
+      "near_m": 0.1, "far_m": 10.0,
+      "source": "derived from h_fov & W=640, H=360, square-pixel pinhole assumption"
+    },
+    "mount_pose": {
+      "frame": "obzg_33",
+      "xyz": [0.05, 0.0, -0.03],
+      "rpy": [0.0, 0.8, 0.0],
+      "source": "Gazebo scene, camera-to-mount-link local pose"
+    }
+  },
+  "objects": [
+    {"name": "nut_big",    "kind": "nut", "xyz": [-0.2286, -0.0999, 0.2815]},
+    {"name": "nut_medium", "kind": "nut", "xyz": [-0.3413, -0.1710, 0.2806]},
+    {"name": "nut_small",  "kind": "nut", "xyz": [-0.2975, -0.0527, 0.2868]},
+    {"name": "box",        "kind": "box", "xyz": [-0.3104,  0.2586, 0.2996]}
+  ]
+}
+```
+
+兼容旧版格式: `camera.position` + `camera.orientation_rpy` 也接受(`__init__.run()` 用)。
+
+字段说明:
+- `camera.intrinsics`:来自场景(h_fov 推导,或平台 API 直接给)
+- `camera.mount_pose`:相机在**挂载 link**(这里是 obzg_33)坐标系下的局部 pose
+  - ⚠️ 不是 world/全局。要用到 base_link 需沿 `camera → mount_link → base_link → world` 链变换
+- `camera.mount_pose.rpy`:rad
+- `objects[*].kind`:`nut` / `box`
+- 螺母按 area 大→小对应 big/medium/small
+- 收纳盒只比对箱子中心 1 个点
+
+## 输出的状态等级
+
+| error (mm) | 状态 | 颜色(overlay) |
+|---|---|---|
+| < 10  | `EXCELLENT` | 绿 |
+| < 50  | `PASS` | 黄 |
+| ≥ 50  | `FAIL` | 红 |
+| 检测/反投影失败 | `MISS` | 灰 |
+
+可在 `config.py` 调 `EXCELLENT_MM` / `OK_MM`。

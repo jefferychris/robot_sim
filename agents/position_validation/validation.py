@@ -43,9 +43,18 @@ class ValidationError(RuntimeError):
 def load_scene_params(path: Optional[str] = None) -> dict:
     """从 JSON 文件加载场景参数。
 
+    支持两种 camera 字段格式(向后兼容):
+      - 旧: {"position": [x,y,z], "orientation_rpy": [r,p,y]}
+      - 新: {"intrinsics": {fx,fy,cx,cy,...}, "mount_pose": {xyz, rpy, frame}}
+
     返回:
         {
-          "camera":   {"name": str, "position": [x,y,z], "orientation_rpy": [r,p,y]},
+          "camera":   {
+              "name": str,
+              "position": [x,y,z], "orientation_rpy": [r,p,y],   # 兼容旧字段
+              "intrinsics": {...} (optional),
+              "mount_pose": {...}  (optional),
+          },
           "objects":  [{"name": str, "kind": "nut"|"box", "xyz": [x,y,z]}, ...]
         }
 
@@ -67,11 +76,31 @@ def load_scene_params(path: Optional[str] = None) -> dict:
     if "camera" not in data:
         raise ValidationError(f"场景参数缺 camera 字段: {path}")
     cam = data["camera"]
-    for key in ("position", "orientation_rpy"):
-        if key not in cam:
-            raise ValidationError(f"camera 缺 {key} 字段: {path}")
-    if len(cam["position"]) != 3 or len(cam["orientation_rpy"]) != 3:
-        raise ValidationError(f"camera.position / orientation_rpy 必须各 3 个数: {path}")
+
+    # 兼容两种格式:旧(position/orientation_rpy)或新(intrinsics+mount_pose)
+    has_old = "position" in cam and "orientation_rpy" in cam
+    has_new = "intrinsics" in cam and "mount_pose" in cam
+    if not has_old and not has_new:
+        raise ValidationError(
+            f"camera 必须含 position+orientation_rpy 或 intrinsics+mount_pose: {path}"
+            f"(当前 keys={list(cam.keys())})"
+        )
+    if has_old:
+        if len(cam["position"]) != 3 or len(cam["orientation_rpy"]) != 3:
+            raise ValidationError(
+                f"camera.position / orientation_rpy 必须各 3 个数: {path}"
+            )
+    if has_new:
+        for key in ("fx", "fy", "cx", "cy"):
+            if key not in cam["intrinsics"]:
+                raise ValidationError(f"camera.intrinsics 缺 {key}: {path}")
+        for key in ("xyz", "rpy"):
+            if key not in cam["mount_pose"]:
+                raise ValidationError(f"camera.mount_pose 缺 {key}: {path}")
+        if len(cam["mount_pose"]["xyz"]) != 3 or len(cam["mount_pose"]["rpy"]) != 3:
+            raise ValidationError(
+                f"camera.mount_pose.xyz / rpy 必须各 3 个数: {path}"
+            )
 
     if "objects" not in data or not data["objects"]:
         raise ValidationError(f"场景参数 objects 列表为空或缺失: {path}")
@@ -121,6 +150,29 @@ def _project_pixel(
         depth=depth,
         intrinsics=cfg.HEAD_CAMERA_INTRINSICS,
         head_to_base_T=cfg.HEAD_TO_BASE_T,
+        table_z_fallback_m=cfg.TABLE_Z_FALLBACK_M,
+    )
+
+
+def project_pixel_with_K_T(
+    u_rgb: float,
+    v_rgb: float,
+    rgb_shape: tuple,
+    depth: np.ndarray,
+    intrinsics: dict,
+    head_to_base_T: np.ndarray,
+) -> Optional[tuple]:
+    """RGB 像素 → base XYZ,用调用方指定的 K + T(不走 config 默认值)。
+
+    给双模式验证脚本用,可在 calibrated T 和 scene-derived T 之间切换。
+    公式与 nut_picker.geometry.pixel_to_base 完全一致,只是参数显式传入。
+    """
+    return nut_geometry.pixel_to_base(
+        u_rgb, v_rgb,
+        rgb_shape=rgb_shape,
+        depth=depth,
+        intrinsics=intrinsics,
+        head_to_base_T=head_to_base_T,
         table_z_fallback_m=cfg.TABLE_Z_FALLBACK_M,
     )
 
