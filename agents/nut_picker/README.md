@@ -112,15 +112,21 @@ BOX_HSV_HIGH = (130, 255, 255)
 
 ### 5. 运动高度(`APPROACH_HEIGHT_M` / `GRASP_HEIGHT_M` / `PLACE_HEIGHT_M`)
 
-首次 sim 全流程后:
+**当前值**:`APPROACH_HEIGHT_M = 0.05`(raw depth 标定后下调)、`GRASP_HEIGHT_M = 0.015`、`PLACE_HEIGHT_M = 0.02`
 
+**为什么 APPROACH 只有 0.05**:raw depth 标定后 nut Z ≈ 0.28m(之前 PNG 路径凑出 0.17m 是错的)。
+APPROACH 抬升后 Z = 0.28 + APPROACH。如果 APPROACH=0.15 → approach Z=0.43 → 超出
+LinkerArmA7 工作空间,pose_check 报 `out_of_workspace`。
+降到 0.05 → approach Z=0.33,在工作空间内。
+
+**再次调整时**:
 ```python
 # 在 pick 成功后 arm.get_pose() 看一下实际 Z
 pose, _ = arm.get_pose()
 print(pose[2])  # 当前 Z
 ```
 
-按需调整三个常量。
+如果 pose_check 仍报 `out_of_workspace`,再降到 0.02-0.03。
 
 ## 检测调参
 

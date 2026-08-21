@@ -1,0 +1,13 @@
+{
+  "camera": {
+    "name": "head_rgb",
+    "position": [-0.0, -0.0, 0.882],
+    "orientation_rpy": [1.571, -0.398, 1.571]
+  },
+  "objects": [
+    {"name": "nut_big",    "kind": "nut", "xyz": [-0.2286, -0.0999, 0.2815]},
+    {"name": "nut_medium", "kind": "nut", "xyz": [-0.3413, -0.1710, 0.2806]},
+    {"name": "nut_small",  "kind": "nut", "xyz": [-0.2975, -0.0527, 0.2868]},
+    {"name": "box",        "kind": "box", "xyz": [-0.3104,  0.2586, 0.2996]}
+  ]
+}

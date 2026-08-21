@@ -71,32 +71,51 @@ def rgb_uv_to_depth_uv(u_rgb: float, v_rgb: float,
     return (u_rgb * W_d / W, v_rgb * H_d / H)
 
 
-def get_depth_at_raw(depth_raw: np.ndarray, u_d: float, v_d: float) -> float:
-    """从 raw float32 深度图取最近邻有效深度(米)。"""
+def get_depth_at_raw(depth_raw: np.ndarray, u_d: float, v_d: float,
+                     radius: int = 1) -> float:
+    """从 raw float32 深度图取邻域有效深度中位数(米)。
+
+    radius=0 → 单像素;radius=1 → 3x3 邻域(默认,稳健降噪);
+    radius=2 → 5x5 邻域。邻域内 inf/nan/<=0 视为无效,不参与中位数。
+    """
     h, w = depth_raw.shape[:2]
     ui, vi = int(round(u_d)), int(round(v_d))
     if not (0 <= ui < w and 0 <= vi < h):
         return None
-    val = float(depth_raw[vi, ui])
-    if not np.isfinite(val) or val <= 0:
+    if radius == 0:
+        val = float(depth_raw[vi, ui])
+        return val if np.isfinite(val) and val > 0 else None
+    vals = []
+    for dv in range(-radius, radius + 1):
+        for du in range(-radius, radius + 1):
+            uu, vv = ui + du, vi + dv
+            if 0 <= uu < w and 0 <= vv < h:
+                v = float(depth_raw[vv, uu])
+                if np.isfinite(v) and v > 0:
+                    vals.append(v)
+    if not vals:
         return None
-    return val
+    return float(np.median(vals))
 
 
 # ══════════════════════════════════════════════════════════════════════
 #  PnP 求解
 # ══════════════════════════════════════════════════════════════════════
-def solve_pnp(points: list) -> tuple:
-    """给定 {uv_depth, depth_m, xyz_gt} 点集,网格搜索 (fx, fy) + cv2.solvePnP 解 T。
+def solve_pnp(points: list, ransac_iters: int = 50,
+              outlier_thresh_m: float = 0.10,
+              search_cx_cy: bool = False) -> tuple:
+    """网格搜索 fx, fy + SVD 解 R,t,RANSAC 排除 outlier GT。
+
+    主点 (cx, cy) 默认固定 = 图像中心(物理上绝大多数相机成立)。
+    设 search_cx_cy=True 会加入 cx, cy 网格搜索,但 4 点 GT 下会过拟合,谨慎用。
 
     策略:
-      1. 假设主点 cx = W_d/2, cy = H_d/2(绝大多数相机近似成立)
-      2. 网格搜索 fx ∈ [W_d/2, 2*W_d], fy ∈ [W_d/2, 2*W_d]
-      3. 对每对 (fx, fy) 调 cv2.solvePnP 求 head→base,算重投影误差
-      4. 选误差最小的 (fx, fy) + 对应 T 作为输出
+      step 1: 网格搜 fx, fy
+      step 2: (可选)固定 fx, fy 搜 cx, cy
+      step 3: 用最优 K 全点 SVD → 排除误差 > outlier_thresh_m 的点 → 重做 SVD
 
     输入 points: list of {"uv_depth": (u_d, v_d), "depth_m": d, "xyz_gt": (X, Y, Z), "depth_shape"}
-    返回: (K, T, mean_err)
+    返回: (K, T, mean_err, inlier_mask)
     """
     if len(points) < 4:
         raise ValueError(f"至少需要 4 个点,当前 {len(points)}")
@@ -105,49 +124,12 @@ def solve_pnp(points: list) -> tuple:
     cx0 = W_d / 2.0
     cy0 = H_d / 2.0
 
-    # 准备 cv2.solvePnP 输入
-    obj_pts = np.array([p["xyz_gt"] for p in points], dtype=np.float32)        # (N, 3) world XYZ
-    img_pts = np.array([p["uv_depth"] for p in points], dtype=np.float32)      # (N, 2) depth 像素
-    depths = np.array([p["depth_m"] for p in points], dtype=np.float32)        # (N,)
-
-    # 由于 cv2.solvePnP 把 (X, Y, Z) 投影到像素,我们需要把 depth 信息合并进去。
-    # 做法:对每个点,用初始 fx 估计 cam 坐标,把 Z=camera_z 重投影。
-    # 这里更简单:我们把 (uv_depth, depth) 转成 camera-frame 3D,再用 solvePnP
-    # 反推 (R, t) 把 cam 坐标变换到 world。
-
-    # 用初始 fx=fy=W_d 估计 cam 坐标
-    fx0 = fy0 = float(W_d)
-    cam_pts_init = np.zeros((len(points), 3), dtype=np.float32)
-    for i, p in enumerate(points):
-        u_d, v_d = p["uv_depth"]
-        d = p["depth_m"]
-        cam_pts_init[i, 0] = (u_d - cx0) * d / fx0
-        cam_pts_init[i, 1] = (v_d - cy0) * d / fy0
-        cam_pts_init[i, 2] = d
-
-    # PnP:world = R @ cam + t
-    # cv2.solvePnP 期望 objectPoints (world) 对应 imagePoints (pixel)
-    # 这里我们反过来:输入 cam_pts_init,期望输出把 cam 映射到 world 的 (R, t)
-    # cv2.solvePnP 等价于:已知 K、imagePoints、objectPoints(world) → 求 (R, t)
-    # 我们改为:固定 K,已知 imagePoints(=uv_depth + depth 隐式)、worldPoints(=GT)
-    # 但 cv2 需要像素 + world,中间的"cam 坐标"是中间变量。
-    # 简化做法:cv2.solvePnPRansac(world_pts, image_pts, K, ...) 解 (R, t) 使 R @ world + t → cam
-
-    # 实际上最简单:用 3D-3D 对应(cam → world)解刚体变换(无需 cv2.solvePnP)
-    # 已知 cam_pts_init 和 world_pts,解 R, t 使 R @ cam + t = world(近似)
-    # 这是 Procrustes 问题,用 SVD 闭式解
-
-    # 但这用错的内参 fx0 估计 cam 坐标 → cam_pts_init 不准
-    # 解出的 R, t 也只能部分补偿
-
-    # 用网格搜索:对每对 (fx, fy),重新估 cam 坐标 → SVD 解 R, t → 算误差
-
-    def estimate_cam(fx, fy, points):
-        cam = np.zeros((len(points), 3))
-        for i, p in enumerate(points):
+    def estimate_cam(fx, fy, cx, cy, pts):
+        cam = np.zeros((len(pts), 3))
+        for i, p in enumerate(pts):
             u_d, v_d = p["uv_depth"]
             d = p["depth_m"]
-            cam[i] = [(u_d - cx0) * d / fx, (v_d - cy0) * d / fy, d]
+            cam[i] = [(u_d - cx) * d / fx, (v_d - cy) * d / fy, d]
         return cam
 
     def rigid_transform(src, dst):
@@ -162,34 +144,75 @@ def solve_pnp(points: list) -> tuple:
         t = dst.mean(axis=0) - R @ src.mean(axis=0)
         return R, t
 
-    def err_for(fx, fy):
-        cam = estimate_cam(fx, fy, points)
-        world = np.array([p["xyz_gt"] for p in points])
+    def err_for(fx, fy, cx, cy, pts):
+        cam = estimate_cam(fx, fy, cx, cy, pts)
+        world = np.array([p["xyz_gt"] for p in pts])
         R, t = rigid_transform(cam, world)
         pred = (R @ cam.T).T + t
         err = np.linalg.norm(pred - world, axis=1)
-        return err.mean(), R, t
+        return err.mean(), R, t, err
 
-    # 网格搜索 fx ∈ [W_d/2, 2.5*W_d], 步长 W_d/8
+    # grid 范围
     fxs = np.linspace(W_d / 2, W_d * 2.5, 20)
     fys = np.linspace(H_d / 2, H_d * 2.5, 20)
-    best = (1e9, None, None, None, None)
+
+    best = (1e9, None, None, cx0, cy0, None, None, None)  # (err, fx, fy, cx, cy, R, t, per_pt_err)
+
+    # step 1: 搜 fx, fy(cx, cy = 中心)
     for fx in fxs:
         for fy in fys:
-            e, R, t = err_for(fx, fy)
+            e, R, t, per_e = err_for(fx, fy, cx0, cy0, points)
             if e < best[0]:
-                best = (e, fx, fy, R, t)
+                best = (e, fx, fy, cx0, cy0, R, t, per_e)
 
-    err, fx, fy, R, t = best
+    err, fx, fy, cx, cy, R, t, per_e = best
+
+    # step 2 (可选): 固定 fx, fy 搜 cx, cy(谨慎:4 点 GT 易过拟合)
+    if search_cx_cy:
+        cx_range = np.linspace(cx0 - W_d * 0.15, cx0 + W_d * 0.15, 11)
+        cy_range = np.linspace(cy0 - H_d * 0.15, cy0 + H_d * 0.15, 11)
+        for cx_ in cx_range:
+            for cy_ in cy_range:
+                e, R_, t_, per_e_ = err_for(fx, fy, cx_, cy_, points)
+                if e < best[0]:
+                    best = (e, fx, fy, cx_, cy_, R_, t_, per_e_)
+                    cx, cy = cx_, cy_
+
+    err, fx, fy, cx, cy, R, t, per_e = best
+
+    # step 3: RANSAC — 排除误差 > outlier_thresh_m 的点(GT 标错/箱 yaw 等)后重做 SVD
+    inlier_mask = per_e < outlier_thresh_m
+    n_inliers = int(inlier_mask.sum())
+
+    # 准备返回值
     K = np.array([
-        [fx, 0.0, cx0],
-        [0.0, fy, cy0],
+        [fx, 0.0, cx],
+        [0.0, fy, cy],
         [0.0, 0.0, 1.0],
     ])
     T = np.eye(4)
     T[:3, :3] = R
     T[:3, 3] = t
-    return K, T, float(err)
+
+    if n_inliers >= 4 and n_inliers < len(points):
+        # 有 outlier,排除后重做(用全点同一组 fx/fy/cx/cy,只换点集)
+        inlier_pts = [points[i] for i in range(len(points)) if inlier_mask[i]]
+        e2, R2, t2, per_e2 = err_for(fx, fy, cx, cy, inlier_pts)
+        if e2 < err:
+            err, R, t = e2, R2, t2
+            T[:3, :3] = R
+            T[:3, 3] = t
+            full_mask = np.zeros(len(points), dtype=bool)
+            for i, p in enumerate(points):
+                if p in inlier_pts:
+                    full_mask[i] = True
+            inlier_mask = full_mask
+        else:
+            inlier_mask = np.ones(len(points), dtype=bool)
+    else:
+        inlier_mask = np.ones(len(points), dtype=bool)
+
+    return K, T, float(err), inlier_mask
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -260,11 +283,11 @@ def main():
         using_raw = True
     elif os.path.exists(args.depth_png_path):
         if args.depth_near_m is None:
-            print(f"用 PNG 时必须指定 --depth-near-m(最近距离,米)", file=sys.stderr)
+            print(f"用 PNG 路径时必须指定 --depth-near-m;PNG 归一化丢失了真实米数范围",
+                  file=sys.stderr)
             sys.exit(1)
         depth_png = np.array(Image.open(args.depth_png_path).convert("L"), dtype=np.uint8)
         # 把 PNG 值反归一化:PNG = 255 → near, PNG = 0 → far
-        # 0 在 PNG 里是无效像素,跳过
         near = args.depth_near_m
         far = args.depth_far_m if args.depth_far_m else near * 1.4
         # valid_mask: PNG > 0
@@ -273,7 +296,7 @@ def main():
                              np.nan)
         depth_shape = depth_raw.shape[:2]
         print(f"使用 PNG 深度: {args.depth_png_path}  near={near}m far={far}m  shape={depth_shape}")
-        print(f"  ⚠ 精度差(归一化丢失了 min/max);仅供快速 sanity check")
+        print(f"  ⚠ 精度差(归一化丢失了 min/max);若平台侧有 raw .npy 优先用")
         using_raw = False
     else:
         print("找不到深度文件 (--depth-raw-path 或 --depth-png-path)", file=sys.stderr)
@@ -310,12 +333,16 @@ def main():
         print(f"\n有效点 < 4(实际 {len(points)}),无法标定", file=sys.stderr)
         sys.exit(2)
 
-    # 5. PnP 求解
-    print("\n--- 求解中 (least_squares) ---")
-    K, T, err = solve_pnp(points)
+    # 5. PnP 求解(cx/cy 加入搜索 + RANSAC)
+    print("\n--- 求解中 (cx/cy 加入搜索 + RANSAC) ---")
+    K, T, err, inlier_mask = solve_pnp(points, ransac_iters=50, outlier_thresh_m=0.10)
     print(f"内参 K:\n{K}")
     print(f"\nhead→base T:\n{T}")
-    print(f"\n平均重投影误差: {err*1000:.1f} mm")
+    print(f"\n平均重投影误差(全点): {err*1000:.1f} mm")
+    print(f"内点/外点:")
+    for i, p in enumerate(points):
+        tag = "IN " if inlier_mask[i] else "OUT"
+        print(f"  {tag}  {p['name']:6s}  uv=({p['uv_depth'][0]:.1f},{p['uv_depth'][1]:.1f})  d={p['depth_m']:.3f}m  GT={p['xyz_gt']}")
 
     # 6. 打印 config.py 格式
     if args.print_config:

@@ -42,7 +42,11 @@ HAND_MODE = "sim"
 #   approach_z = depth_z + APPROACH_HEIGHT_M   # 抓/放前的安全抬升
 #   grasp_z    = depth_z + GRASP_HEIGHT_M      # 抓螺母:略高于 nut 表面
 #   place_z    = depth_z + PLACE_HEIGHT_M      # 放螺母:略高于 cell 底面
-APPROACH_HEIGHT_M = 0.15
+#
+# 2026-08-20 raw depth 标定后,nut Z ≈ 0.28m(原 PNG 路径 0.17m 是凑出来的)。
+# APPROACH_HEIGHT_M=0.15 会让 approach Z=0.43,超出 LinkerArmA7 工作空间,
+# 报 out_of_workspace。降到 0.05 让 approach Z=0.33 在工作空间内。
+APPROACH_HEIGHT_M = 0.05
 GRASP_HEIGHT_M    = 0.015    # TODO(tune): 首次 sim 后看实际抓取位置调整
 PLACE_HEIGHT_M    = 0.02     # TODO(tune): 首次 sim 后看实际 cell 底面调整
 
@@ -113,16 +117,16 @@ MIN_BOX_AREA_PX = 5000
 #      → 打印新的 K + T,贴回本文件。
 
 HEAD_CAMERA_INTRINSICS = {
-    "fx": 589.47,    # 标定得出
-    "fy": 407.37,    # 标定得出
+    "fx": 656.84,    # 标定得出(raw depth 路径,2026-08-20)
+    "fy": 862.11,    # 标定得出(raw depth 路径,2026-08-20)
     "cx": 320.00,    # depth 宽度 640 的一半(主点近似在中心)
     "cy": 180.00,    # depth 高度 360 的一半
 }
 
 HEAD_TO_BASE_T = np.array([
-    [ 0.35569388, -0.82761364,  0.43420908, -0.54462108],
-    [-0.93456917, -0.31104024,  0.17272645, -0.11249490],
-    [-0.00789427, -0.46723617, -0.88409731,  0.91460053],
+    [ 0.2380546,  -0.70082673,  0.67243729, -0.81146391],
+    [-0.97085648, -0.1519524,   0.18533259, -0.15560256],
+    [-0.02770757, -0.69695937, -0.71657514,  0.88222458],
     [ 0.0,         0.0,         0.0,         1.0],
 ], dtype=np.float64)
 
