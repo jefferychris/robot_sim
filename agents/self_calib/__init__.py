@@ -165,7 +165,10 @@ def run():
     logger.info("深度图 %dx%d", Wd, Hd)
 
     arm = LinkerArmA7(robot_id=ARM_ID, mode="sim")
-    logger.info("DOF=%s  JOINT_LIMITS=%s", arm.DOF, arm.JOINT_LIMITS)
+    # sim 模式下返回的是 ArmClient 代理,类常量要从 LinkerArmA7 本身读
+    logger.info("DOF=%s  JOINT_LIMITS=%s",
+                getattr(LinkerArmA7, "DOF", "?"),
+                getattr(LinkerArmA7, "JOINT_LIMITS", "?"))
 
     samples = []
     prev_depth = None
