@@ -80,33 +80,43 @@ def _setup_logging():
 
 
 def _probe_poses():
-    """6 个探测位姿:朝 Y 负(桌子侧)小幅试探,确认相机能拍到手臂。"""
+    """6 个探测位姿:靠肘关节把末端送向 X 负侧低位(螺母所在方向)。
+
+    v2 失败教训:关节1(肩 pitch)限位是 (-3.2, +0.07),v2 用的 +0.3~+0.75
+    全部越上限,指令被拒,六次末端纹丝不动(深度变化 0.0000)。
+    v1 用负值确实动了,但末端 Z 一路抬高(-0.41 → -0.24 → +0.005),
+    手臂朝天举起,不在俯视相机画面内。
+    v1 中真正有效的是**肘关节**:[0,0,0,-0.4/-0.8/-1.2] 让末端
+    X 走到 -0.15/-0.28/-0.32 且 Z 保持低位 —— 与螺母 X(-0.25~-0.31) 同向。
+    """
     return [
-        [0.0,  0.0,  0.0,  0.0, 0.0, 0.0, 0.0],   # home 基准帧
-        [0.0,  0.3,  0.0, -0.3, 0.0, 0.0, 0.0],
-        [0.0,  0.5,  0.0, -0.5, 0.0, 0.0, 0.0],
-        [-0.3, 0.4,  0.0, -0.4, 0.0, 0.0, 0.0],
-        [0.3,  0.4,  0.0, -0.4, 0.0, 0.0, 0.0],
-        [0.0,  0.6,  0.0, -0.7, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0,  0.0,  0.0, 0.0, 0.0],   # home 基准帧
+        [0.0, 0.0, 0.0, -0.5,  0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, -0.9,  0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, -1.3,  0.0, 0.0, 0.0],
+        [0.0, -0.2, 0.0, -0.9, 0.0, 0.0, 0.0],
+        [0.0, -0.2, 0.0, -1.3, 0.0, 0.0, 0.0],
     ]
 
 
 def _full_poses():
-    """全量位姿:在 Y 负侧(桌子方向)分层铺开。
+    """全量位姿:以肘为主在低位铺开,肩 pitch 只做小幅负向偏置。
 
-    沿用 yizhi auto_calibrate 的分布原则:多高度 + XY 铺开 + 姿态偏转,
-    数值按仿真实测重定。肩 pitch 取**正值**才朝桌子(v1 取负值是反的)。
+    约束(实测 JOINT_LIMITS):
+      关节1 肩 pitch ∈ (-3.2, +0.07) —— 只能负向,且负得越多末端抬得越高
+      故这里限制在 [-0.3, 0],避免末端离开俯视相机视野。
+    分布原则沿用 yizhi auto_calibrate(多高度 + XY 铺开 + 姿态偏转)。
     """
     out = []
-    for sh in (0.3, 0.45, 0.6, 0.75):              # 肩 pitch:主导前伸与高度
-        for el in (-0.3, -0.5, -0.7):              # 肘:调节远近
+    for el in (-0.5, -0.7, -0.9, -1.1, -1.3):       # 肘:主导 X 前伸
+        for sh in (0.0, -0.15, -0.3):               # 肩:小幅,控制高度
             out.append([0.0, sh, 0.0, el, 0.0, 0.0, 0.0])
-    for roll in (-0.4, -0.2, 0.2, 0.4):            # 肩 roll:左右铺开
-        out.append([roll, 0.5, 0.0, -0.5, 0.0, 0.0, 0.0])
-    for yaw in (-0.4, 0.4):                        # 肩 yaw
-        out.append([0.0, 0.5, yaw, -0.5, 0.0, 0.0, 0.0])
-    for wr in (-0.4, 0.4):                         # 腕:小幅改变末端朝向
-        out.append([0.0, 0.5, 0.0, -0.5, 0.0, wr, 0.0])
+    for roll in (-0.5, -0.25, 0.25, 0.5):           # 肩 roll:左右铺开
+        out.append([roll, -0.1, 0.0, -0.9, 0.0, 0.0, 0.0])
+    for yaw in (-0.5, 0.5):                         # 肩 yaw
+        out.append([0.0, -0.1, yaw, -0.9, 0.0, 0.0, 0.0])
+    for wr in (-0.5, 0.5):                          # 腕 roll
+        out.append([0.0, -0.1, 0.0, -0.9, 0.0, wr, 0.0])
     return out
 
 
@@ -165,12 +175,19 @@ def _solve(samples, Wd, Hd):
     return best
 
 
-def _collect(arm, hub, poses, ref_depth, label, samples):
+def _collect(arm, hub, poses, ref_depth, label, samples, ref_pos=None):
     """跑一批位姿,采样并落盘深度图。返回更新后的 ref_depth。"""
     for i, q in enumerate(poses):
         logger.info("-" * 68)
         logger.info("[%s %2d/%d] move_joints %s", label, i + 1, len(poses),
                     [round(v, 2) for v in q])
+        lim = getattr(LinkerArmA7, "JOINT_LIMITS", None)
+        if lim:
+            bad = [(j, v, lim[j]) for j, v in enumerate(q)
+                   if j < len(lim) and not (lim[j][0] <= v <= lim[j][1])]
+            if bad:
+                logger.warning("     关节越限,跳过: %s", bad)
+                continue
         try:
             arm.move_joints(q, blocking=True)
         except Exception as e:
@@ -196,12 +213,15 @@ def _collect(arm, hub, poses, ref_depth, label, samples):
 
         logger.info("     末端 base=(%.4f, %.4f, %.4f)  rpy=(%.3f, %.3f, %.3f)",
                     *pos, *rpy)
+        if ref_pos is not None and np.linalg.norm(np.array(pos) - ref_pos) < 1e-4:
+            logger.warning("     ⚠ 末端与基准帧完全相同 —— 指令未生效(越限或被拒)")
 
         np.save(os.path.join(FRAME_DIR, "calib_%s_%s_%02d.npy"
                              % (RUN_STAMP, label, i)), depth)
 
         if ref_depth is None:
             ref_depth = depth
+            ref_pos = np.array(pos, float)
             logger.info("     ← 设为基准帧(home 姿态,手臂不在桌面视野)")
             continue
 
@@ -214,13 +234,13 @@ def _collect(arm, hub, poses, ref_depth, label, samples):
         logger.info("     depth_px=(%.1f, %.1f)  z=%.4f m  area=%d px  ✓ 采纳",
                     u, v, z, area)
         samples.append({"base": np.array(pos, float), "u": u, "v": v, "z": z})
-    return ref_depth
+    return ref_depth, ref_pos
 
 
 def run():
     run_log = _setup_logging()
     logger.info("=" * 68)
-    logger.info("自标定 v2 —— Y 负侧(桌子方向)采样,带撞桌保护")
+    logger.info("自标定 v3 —— 肘关节主导、低位铺开(肩 pitch 正值越限,v2 六次未动)")
     logger.info("本次日志: %s  (最近一次镜像: %s)", run_log, LATEST_LOG)
     logger.info("=" * 68)
 
@@ -240,7 +260,7 @@ def run():
 
     # ── 阶段一:探测 ────────────────────────────────────────────────
     logger.info("\n【阶段一】探测 6 点,确认相机能拍到手臂")
-    ref = _collect(arm, hub, _probe_poses(), None, "probe", samples)
+    ref, ref_pos = _collect(arm, hub, _probe_poses(), None, "probe", samples)
     logger.info("=" * 68)
     logger.info("探测阶段采到 %d 个样本", len(samples))
 
@@ -258,7 +278,7 @@ def run():
 
     # ── 阶段二:全量 ────────────────────────────────────────────────
     logger.info("\n【阶段二】全量采集")
-    _collect(arm, hub, _full_poses(), ref, "full", samples)
+    _collect(arm, hub, _full_poses(), ref, "full", samples, ref_pos)
 
     try:
         arm.home(blocking=True)
