@@ -198,9 +198,15 @@ def _collect(arm, hub, poses, ref_depth, label, samples, ref_pos=None):
 
         try:
             pos, rpy = arm.get_pose()
+            actual_q = arm.get_joint_angles()
         except Exception as e:
             logger.warning("     读位姿失败: %s", str(e)[:90])
             continue
+        # 指令关节角 vs 实际关节角:差异大说明 IK/限位把指令改写了
+        dq = [round(a - b, 3) for a, b in zip(actual_q, q)]
+        if max(abs(v) for v in dq) > 0.05:
+            logger.info("     关节指令→实际偏差 %s", dq)
+            logger.info("     实际关节角 %s", [round(v, 3) for v in actual_q])
 
         if pos[2] < Z_FLOOR:
             logger.warning("     末端 Z=%.4f 低于安全下限 %.2f,跳过采样", pos[2], Z_FLOOR)
@@ -212,8 +218,10 @@ def _collect(arm, hub, poses, ref_depth, label, samples, ref_pos=None):
             continue
         depth = fr["array"].copy()
 
-        logger.info("     末端 base=(%.4f, %.4f, %.4f)  rpy=(%.3f, %.3f, %.3f)",
-                    *pos, *rpy)
+        moved = ("" if ref_pos is None
+                 else "  |位移 %.3f m|" % np.linalg.norm(np.array(pos) - ref_pos))
+        logger.info("     末端 base=(%.4f, %.4f, %.4f)  rpy=(%.3f, %.3f, %.3f)%s",
+                    *pos, *rpy, moved)
 
 
         np.save(os.path.join(FRAME_DIR, "calib_%s_%s_%02d.npy"
@@ -232,6 +240,13 @@ def _collect(arm, hub, poses, ref_depth, label, samples, ref_pos=None):
         for base_frame, tag in ((ref_depth, "vs-home"), (prev_depth, "vs-prev")):
             r, dm = _find_tool_px(depth, base_frame)
             cand.append((r, dm, tag))
+            if base_frame is not None and base_frame.shape == depth.shape:
+                dd = np.abs(depth.astype(np.float64) - base_frame.astype(np.float64))
+                dd[~np.isfinite(dd)] = 0.0
+                over = int((dd > MIN_DEPTH_DELTA).sum())
+                logger.info("     [差分 %s] max=%.4f  p99=%.4f  超阈像素=%d  命中=%s",
+                            tag, dd.max(), float(np.percentile(dd, 99)),
+                            over, "是" if r else "否")
         cand.sort(key=lambda c: (c[0] is None, -c[1]))
         hit, dmax, tag = cand[0]
         prev_depth = depth
@@ -249,20 +264,52 @@ def _collect(arm, hub, poses, ref_depth, label, samples, ref_pos=None):
 def run():
     run_log = _setup_logging()
     logger.info("=" * 68)
-    logger.info("自标定 v4 —— 阈值下调 + 双基准差分(v3 手臂已动,但深度变化 0.012 < 阈值 0.015)")
+    logger.info("自标定 v5 —— 全链路诊断日志(topic/关节偏差/差分统计/位移)")
     logger.info("本次日志: %s  (最近一次镜像: %s)", run_log, LATEST_LOG)
     logger.info("=" * 68)
 
+    logger.info("订阅相机: %s", CAMERAS)
     hub = CameraHub(CAMERAS, node_name="self_calib_cam")
+
+    # 先看 ROS 侧到底有没有东西在发 —— 收不到帧时这是第一诊断依据
+    try:
+        tops = hub.node.get_topic_names_and_types()
+        logger.info("[诊断] ROS topic 总数=%d", len(tops))
+        want = set(CAMERAS.values())
+        for t, ty in sorted(tops):
+            if "cam" in t.lower() or t.lstrip("/") in want:
+                logger.info("[诊断]   %-52s %s  %s", t, ",".join(ty),
+                            "← 本次订阅" if t.lstrip("/") in want else "")
+        missing = [v for v in want
+                   if not any(t.lstrip("/") == v for t, _ in tops)]
+        if missing:
+            logger.error("[诊断] 以下 topic 在 ROS 图中不存在: %s", missing)
+            logger.error("[诊断] => 仿真未启动、或场景重置后相机节点未恢复")
+    except Exception as e:
+        logger.warning("[诊断] 列 topic 失败: %s", e)
+
     deadline = time.time() + WAIT_FIRST_FRAME
+    last_report = 0.0
     while time.time() < deadline and "head_depth" not in hub.get_all():
         time.sleep(0.2)
+        waited = WAIT_FIRST_FRAME - (deadline - time.time())
+        if waited - last_report >= 2.0:
+            last_report = waited
+            logger.info("[诊断] 等待首帧 %.0fs/%.0fs,已收到: %s",
+                        waited, WAIT_FIRST_FRAME, list(hub.get_all()) or "(无)")
     if "head_depth" not in hub.get_all():
-        logger.error("未收到 head_depth,退出。确认仿真已启动。")
+        logger.error("未收到 head_depth,退出。已收到的路: %s", list(hub.get_all()))
+        logger.error("排查顺序:1) RTF 是否≈1.00  2) pgrep -af 'python main.py' "
+                     "是否有残留进程占用节点  3) 停止再启动仿真(非重置)")
         hub.shutdown()
         return None
     Hd, Wd = hub.get_frame("head_depth")["array"].shape
-    logger.info("深度图 %dx%d;末端 Z 安全下限 %.2f", Wd, Hd, Z_FLOOR)
+    d0 = hub.get_frame("head_depth")["array"]
+    fin = np.isfinite(d0) & (d0 > 0)
+    logger.info("深度图 %dx%d;有效 %.1f%%;range %.3f~%.3f m;末端 Z 下限 %.2f",
+                Wd, Hd, 100 * fin.mean(),
+                float(d0[fin].min()) if fin.any() else -1,
+                float(d0[fin].max()) if fin.any() else -1, Z_FLOOR)
 
     arm = LinkerArmA7(robot_id=ARM_ID, mode="sim")
     samples = []
@@ -272,6 +319,9 @@ def run():
     ref, ref_pos = _collect(arm, hub, _probe_poses(), None, "probe", samples)
     logger.info("=" * 68)
     logger.info("探测阶段采到 %d 个样本", len(samples))
+    for k, sm in enumerate(samples):
+        logger.info("  #%d base=(%7.4f,%7.4f,%7.4f)  px=(%.1f,%.1f)  z=%.4f",
+                    k, *sm["base"], sm["u"], sm["v"], sm["z"])
 
     if not samples:
         logger.error("探测阶段一个都没采到 —— 手臂可能仍在相机视野外。")
