@@ -54,8 +54,8 @@ SETTLE_S = 1.5
 # 安全:末端 Z 不低于此值,避免撞桌(home 在 -0.6082,桌面更低)
 Z_FLOOR = -0.62
 # 帧差判定阈值
-MIN_DEPTH_DELTA = 0.015
-MIN_BLOB_PX = 20
+MIN_DEPTH_DELTA = 0.004
+MIN_BLOB_PX = 8
 
 logger = logging.getLogger("self_calib")
 RUN_STAMP = time.strftime("%Y%m%d-%H%M%S")
@@ -123,7 +123,7 @@ def _full_poses():
 def _find_tool_px(depth, ref_depth):
     """用「与基准帧的深度差」定位末端:场景静止,只有手臂在动。"""
     if ref_depth is None or ref_depth.shape != depth.shape:
-        return None
+        return None, 0.0
     d = np.abs(depth.astype(np.float64) - ref_depth.astype(np.float64))
     d[~np.isfinite(d)] = 0.0
     if d.max() < MIN_DEPTH_DELTA:
@@ -176,6 +176,7 @@ def _solve(samples, Wd, Hd):
 
 
 def _collect(arm, hub, poses, ref_depth, label, samples, ref_pos=None):
+    prev_depth = ref_depth
     """跑一批位姿,采样并落盘深度图。返回更新后的 ref_depth。"""
     for i, q in enumerate(poses):
         logger.info("-" * 68)
@@ -213,8 +214,7 @@ def _collect(arm, hub, poses, ref_depth, label, samples, ref_pos=None):
 
         logger.info("     末端 base=(%.4f, %.4f, %.4f)  rpy=(%.3f, %.3f, %.3f)",
                     *pos, *rpy)
-        if ref_pos is not None and np.linalg.norm(np.array(pos) - ref_pos) < 1e-4:
-            logger.warning("     ⚠ 末端与基准帧完全相同 —— 指令未生效(越限或被拒)")
+
 
         np.save(os.path.join(FRAME_DIR, "calib_%s_%s_%02d.npy"
                              % (RUN_STAMP, label, i)), depth)
@@ -222,17 +222,26 @@ def _collect(arm, hub, poses, ref_depth, label, samples, ref_pos=None):
         if ref_depth is None:
             ref_depth = depth
             ref_pos = np.array(pos, float)
+            prev_depth = depth
             logger.info("     ← 设为基准帧(home 姿态,手臂不在桌面视野)")
             continue
 
-        hit, dmax = _find_tool_px(depth, ref_depth)
+        # 双基准:跟 home 比 + 跟上一帧比,取信号更强的。
+        # 相邻位姿间手臂位移大,帧间差分往往比跟 home 比更明显。
+        cand = []
+        for base_frame, tag in ((ref_depth, "vs-home"), (prev_depth, "vs-prev")):
+            r, dm = _find_tool_px(depth, base_frame)
+            cand.append((r, dm, tag))
+        cand.sort(key=lambda c: (c[0] is None, -c[1]))
+        hit, dmax, tag = cand[0]
+        prev_depth = depth
         if hit is None:
             logger.info("     未定位到末端 (最大深度变化 %.4f m,阈值 %.3f)",
                         dmax, MIN_DEPTH_DELTA)
             continue
         u, v, z, area = hit
-        logger.info("     depth_px=(%.1f, %.1f)  z=%.4f m  area=%d px  ✓ 采纳",
-                    u, v, z, area)
+        logger.info("     depth_px=(%.1f, %.1f)  z=%.4f m  area=%d px  [%s]  ✓ 采纳",
+                    u, v, z, area, tag)
         samples.append({"base": np.array(pos, float), "u": u, "v": v, "z": z})
     return ref_depth, ref_pos
 
@@ -240,7 +249,7 @@ def _collect(arm, hub, poses, ref_depth, label, samples, ref_pos=None):
 def run():
     run_log = _setup_logging()
     logger.info("=" * 68)
-    logger.info("自标定 v3 —— 肘关节主导、低位铺开(肩 pitch 正值越限,v2 六次未动)")
+    logger.info("自标定 v4 —— 阈值下调 + 双基准差分(v3 手臂已动,但深度变化 0.012 < 阈值 0.015)")
     logger.info("本次日志: %s  (最近一次镜像: %s)", run_log, LATEST_LOG)
     logger.info("=" * 68)
 
