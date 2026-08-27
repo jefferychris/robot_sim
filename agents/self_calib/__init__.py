@@ -23,7 +23,9 @@ Y 从 0.2035 一路涨到 0.8117 —— 而用户观察到手臂"背对桌子"�
 ════════ 用法 ════════
 点「启动仿真」并勾选「启动当前智能体工程」,或终端 python main.py。
 先跑 PROBE 阶段(6 点,慢速,确认能拍到手臂),再自动进入全量采集。
-日志落盘 camera_frames/self_calib.log;每帧深度图存 camera_frames/calib_*.npy。
+日志落盘 camera_frames/logs/self_calib_<时间戳>.log(保留历史),
+最近一次镜像到 camera_frames/self_calib_latest.log;
+每帧深度图存 camera_frames/calib_<时间戳>_*.npy。
 """
 
 import logging
@@ -39,8 +41,11 @@ from agents.camera_demo.config import CAMERAS as _ALL
 
 __all__ = ["run"]
 
-LOG_PATH = "camera_frames/self_calib.log"
 FRAME_DIR = "camera_frames"
+LOG_DIR = "camera_frames/logs"
+# 每次运行写一个带时间戳的新文件,不覆盖历史(前后对比是排查的主要手段);
+# 同时把最近一次复制成 latest,方便直接 cat。
+LATEST_LOG = "camera_frames/self_calib_latest.log"
 CAMERAS = {k: v for k, v in _ALL.items() if k.startswith("head_")}
 ARM_ID = "rbd03ebf4ebf83c6a6a64754454bc520a"      # 左臂
 WAIT_FIRST_FRAME = 20.0
@@ -53,18 +58,25 @@ MIN_DEPTH_DELTA = 0.015
 MIN_BLOB_PX = 20
 
 logger = logging.getLogger("self_calib")
+RUN_STAMP = time.strftime("%Y%m%d-%H%M%S")
 
 
 def _setup_logging():
-    os.makedirs(FRAME_DIR, exist_ok=True)
+    """日志写到带时间戳的新文件(保留历史),并镜像一份到 latest。"""
+    os.makedirs(LOG_DIR, exist_ok=True)
+    run_log = os.path.join(LOG_DIR, "self_calib_%s.log"
+                           % time.strftime("%Y%m%d-%H%M%S"))
     fmt = logging.Formatter("%(asctime)s [%(name)s] %(message)s")
     root = logging.getLogger()
     root.setLevel(logging.INFO)
     for h in list(root.handlers):
         root.removeHandler(h)
-    for h in (logging.StreamHandler(), logging.FileHandler(LOG_PATH, mode="w")):
+    for h in (logging.StreamHandler(),
+              logging.FileHandler(run_log, mode="w"),
+              logging.FileHandler(LATEST_LOG, mode="w")):
         h.setFormatter(fmt)
         root.addHandler(h)
+    return run_log
 
 
 def _probe_poses():
@@ -185,7 +197,8 @@ def _collect(arm, hub, poses, ref_depth, label, samples):
         logger.info("     末端 base=(%.4f, %.4f, %.4f)  rpy=(%.3f, %.3f, %.3f)",
                     *pos, *rpy)
 
-        np.save(os.path.join(FRAME_DIR, "calib_%s_%02d.npy" % (label, i)), depth)
+        np.save(os.path.join(FRAME_DIR, "calib_%s_%s_%02d.npy"
+                             % (RUN_STAMP, label, i)), depth)
 
         if ref_depth is None:
             ref_depth = depth
@@ -205,9 +218,10 @@ def _collect(arm, hub, poses, ref_depth, label, samples):
 
 
 def run():
-    _setup_logging()
+    run_log = _setup_logging()
     logger.info("=" * 68)
     logger.info("自标定 v2 —— Y 负侧(桌子方向)采样,带撞桌保护")
+    logger.info("本次日志: %s  (最近一次镜像: %s)", run_log, LATEST_LOG)
     logger.info("=" * 68)
 
     hub = CameraHub(CAMERAS, node_name="self_calib_cam")
@@ -232,7 +246,8 @@ def run():
 
     if not samples:
         logger.error("探测阶段一个都没采到 —— 手臂可能仍在相机视野外。")
-        logger.error("深度图已存 camera_frames/calib_probe_*.npy,可离线分析。")
+        logger.error("深度图已存 camera_frames/calib_%s_probe_*.npy,可离线分析。",
+                     RUN_STAMP)
         try:
             arm.home(blocking=True)
             arm.shutdown()
