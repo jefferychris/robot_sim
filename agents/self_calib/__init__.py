@@ -1,28 +1,29 @@
-"""自标定 agent:用机械臂自身当标定物,解 head 相机 → base 的外参。
+"""自标定 agent:用机械臂自身当标定靶,解 head 相机 → base 的外参。
 
-════════ 为什么要这么做 ════════
-现有 HEAD_TO_BASE_T 是拿 gt.json 的 4 个点(3 螺母 + 1 箱子)Kabsch 拟合的。
-这 4 点几乎共面(Z 差 < 2cm),旋转分量极不稳定 —— 误差 43.7mm,换位置就失准。
+════════ 为什么需要它 ════════
+现有 HEAD_TO_BASE_T 来自 gt.json 的 4 点 Kabsch 拟合。4 点几乎共面
+(Z 跨度 < 2cm),旋转分量不稳 —— 误差 43.7mm 且换位置就失准。
+其余路径均已实测排除:场景 JSON 缺 obzg_33→base_link;TF 树为空;
+方像素 53.5mm;残差修正 LOO 417mm;俯仰约束 96.9mm。
 
-其它路径均已验证不通:
-  · 场景 JSON 只给 相机→obzg_33,缺 obzg_33→base_link,链条断裂
-  · TF 树实测为空,平台不发布
-  · 方像素约束(53.5mm)/残差修正(LOO 417mm)/俯仰约束(96.9mm) 全部更差
+本方案让机械臂当标定靶:move_joints 走一批位姿 → get_pose() 读回
+**机器人自报的 base 坐标**(绝对可信)→ 同时拍深度图 → 帧差定位末端
+→ 得 (base ↔ 像素+深度) 对。点数任意多、Z 可充分分散。
 
-本方案让机械臂自己当标定靶:
-  move_joints(q) 移动到一批关节位姿 → get_pose() 读回**机器人自报的 base 坐标**
-  (绝对可信) → 同时头部相机拍照 → 在深度图中定位末端 → 得到 (base ↔ 像素+深度) 对。
-点数任意多、Z 可充分分散,从根上解决 4 点共面的问题。
+════════ 上一轮(v1)的教训 ════════
+17 个位姿全部"未定位到末端"。原因:v1 用肩 pitch 负向偏置,实测末端
+Y 从 0.2035 一路涨到 0.8117 —— 而用户观察到手臂"背对桌子"运动。
+=> **Y 正方向背对桌子,桌子在 Y 负侧**;手臂全程在相机视野外,自然拍不到。
+(顺带:视觉给的螺母 Y=-0.067/-0.168/-0.090 符号其实是对的。)
+另有若干位姿撞到桌子,故本版加 pose_check 预检 + Z 下限保护。
 
-SDK 事实(tools/scan_sdk.py 实测):
-  REMOTE_SERVICES = {pose_check, get_joint_angles, is_moving, get_pose, stop}
-  REMOTE_ACTIONS  = {move_to, move_joints, home}
-  无 fk/ik/tool_frame 服务,但 DH_PARAMS / JOINT_LIMITS / JOINT_SIGN 在类上可读。
-  move_to/pose_check 的默认 pitch 本就是 π —— config 的 GRIPPER_PITCH 并非笔误。
+位姿设计沿用 yizhi-robot/src_remote/auto_calibrate.py 的分布原则
+(多高度分层 + XY 铺开 + 姿态偏转),但数值按仿真实测可达范围重定。
 
 ════════ 用法 ════════
-在平台点「启动仿真」并勾选「启动当前智能体工程」即可(main.py 的
-DEFAULT_AGENT 已指向 self_calib);日志同时写到 camera_frames/self_calib.log。
+点「启动仿真」并勾选「启动当前智能体工程」,或终端 python main.py。
+先跑 PROBE 阶段(6 点,慢速,确认能拍到手臂),再自动进入全量采集。
+日志落盘 camera_frames/self_calib.log;每帧深度图存 camera_frames/calib_*.npy。
 """
 
 import logging
@@ -39,16 +40,23 @@ from agents.camera_demo.config import CAMERAS as _ALL
 __all__ = ["run"]
 
 LOG_PATH = "camera_frames/self_calib.log"
+FRAME_DIR = "camera_frames"
 CAMERAS = {k: v for k, v in _ALL.items() if k.startswith("head_")}
 ARM_ID = "rbd03ebf4ebf83c6a6a64754454bc520a"      # 左臂
 WAIT_FIRST_FRAME = 20.0
-SETTLE_S = 1.2                                    # 到位后等画面稳定
+SETTLE_S = 1.5
+
+# 安全:末端 Z 不低于此值,避免撞桌(home 在 -0.6082,桌面更低)
+Z_FLOOR = -0.62
+# 帧差判定阈值
+MIN_DEPTH_DELTA = 0.015
+MIN_BLOB_PX = 20
 
 logger = logging.getLogger("self_calib")
 
 
 def _setup_logging():
-    os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+    os.makedirs(FRAME_DIR, exist_ok=True)
     fmt = logging.Formatter("%(asctime)s [%(name)s] %(message)s")
     root = logging.getLogger()
     root.setLevel(logging.INFO)
@@ -57,67 +65,67 @@ def _setup_logging():
     for h in (logging.StreamHandler(), logging.FileHandler(LOG_PATH, mode="w")):
         h.setFormatter(fmt)
         root.addHandler(h)
-    logger.info("日志同时写入 %s", LOG_PATH)
 
 
-def _poses():
-    """一批关节位姿,让末端在工作空间里铺开(尤其让 Z 分散)。
+def _probe_poses():
+    """6 个探测位姿:朝 Y 负(桌子侧)小幅试探,确认相机能拍到手臂。"""
+    return [
+        [0.0,  0.0,  0.0,  0.0, 0.0, 0.0, 0.0],   # home 基准帧
+        [0.0,  0.3,  0.0, -0.3, 0.0, 0.0, 0.0],
+        [0.0,  0.5,  0.0, -0.5, 0.0, 0.0, 0.0],
+        [-0.3, 0.4,  0.0, -0.4, 0.0, 0.0, 0.0],
+        [0.3,  0.4,  0.0, -0.4, 0.0, 0.0, 0.0],
+        [0.0,  0.6,  0.0, -0.7, 0.0, 0.0, 0.0],
+    ]
 
-    以 home(全零)为基准逐关节偏置。JOINT_LIMITS 已知,取值都在限位内。
+
+def _full_poses():
+    """全量位姿:在 Y 负侧(桌子方向)分层铺开。
+
+    沿用 yizhi auto_calibrate 的分布原则:多高度 + XY 铺开 + 姿态偏转,
+    数值按仿真实测重定。肩 pitch 取**正值**才朝桌子(v1 取负值是反的)。
     """
-    base = [0.0] * 7
-    out = [list(base)]
-    for j, deltas in {
-        1: (-0.5, -0.9, -1.3),        # 肩 pitch:主导末端高低 → Z 分散
-        3: (-0.4, -0.8, -1.2),        # 肘:主导前后伸展
-        0: (-0.4, 0.4),               # 肩 roll:主导左右
-        2: (-0.5, 0.5),
-        5: (-0.5, 0.5),
-    }.items():
-        for d in deltas:
-            q = list(base)
-            q[j] = d
-            out.append(q)
-    # 组合位姿,进一步分散
-    for a, b in ((-0.6, -0.5), (-1.0, -0.8), (-0.8, -1.1), (-1.2, -0.6)):
-        q = list(base)
-        q[1], q[3] = a, b
-        out.append(q)
+    out = []
+    for sh in (0.3, 0.45, 0.6, 0.75):              # 肩 pitch:主导前伸与高度
+        for el in (-0.3, -0.5, -0.7):              # 肘:调节远近
+            out.append([0.0, sh, 0.0, el, 0.0, 0.0, 0.0])
+    for roll in (-0.4, -0.2, 0.2, 0.4):            # 肩 roll:左右铺开
+        out.append([roll, 0.5, 0.0, -0.5, 0.0, 0.0, 0.0])
+    for yaw in (-0.4, 0.4):                        # 肩 yaw
+        out.append([0.0, 0.5, yaw, -0.5, 0.0, 0.0, 0.0])
+    for wr in (-0.4, 0.4):                         # 腕:小幅改变末端朝向
+        out.append([0.0, 0.5, 0.0, -0.5, 0.0, wr, 0.0])
     return out
 
 
-def _find_tool_px(depth, prev_depth):
-    """用「移动前后深度差」定位末端:变化最大的连通区域即手臂所在。
-
-    比在 RGB 里找特征稳:场景静止,只有手臂在动,差分天然把它分离出来。
-    返回 (u, v, z) —— depth 图坐标与该点深度(米)。
-    """
-    if prev_depth is None or prev_depth.shape != depth.shape:
+def _find_tool_px(depth, ref_depth):
+    """用「与基准帧的深度差」定位末端:场景静止,只有手臂在动。"""
+    if ref_depth is None or ref_depth.shape != depth.shape:
         return None
-    d = np.abs(depth.astype(np.float64) - prev_depth.astype(np.float64))
+    d = np.abs(depth.astype(np.float64) - ref_depth.astype(np.float64))
     d[~np.isfinite(d)] = 0.0
-    if d.max() < 0.02:                            # 变化太小,认为没动
-        return None
-    mask = d > max(0.02, d.max() * 0.35)
-    if mask.sum() < 25:
-        return None
+    if d.max() < MIN_DEPTH_DELTA:
+        return None, d.max()
+    mask = d > max(MIN_DEPTH_DELTA, d.max() * 0.35)
+    if mask.sum() < MIN_BLOB_PX:
+        return None, d.max()
     try:
         import cv2
-        m8 = mask.astype(np.uint8)
-        n, lab, stats, cent = cv2.connectedComponentsWithStats(m8, 8)
+        n, lab, stats, cent = cv2.connectedComponentsWithStats(mask.astype(np.uint8), 8)
         if n <= 1:
-            return None
+            return None, d.max()
         i = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
         u, v = cent[i]
         sel = (lab == i) & np.isfinite(depth) & (depth > 0)
         if sel.sum() < 10:
-            return None
-        return float(u), float(v), float(np.median(depth[sel]))
+            return None, d.max()
+        return (float(u), float(v), float(np.median(depth[sel])),
+                int(stats[i, cv2.CC_STAT_AREA])), d.max()
     except ImportError:
         vs, us = np.nonzero(mask)
-        u, v = float(us.mean()), float(vs.mean())
         sel = mask & np.isfinite(depth) & (depth > 0)
-        return u, v, float(np.median(depth[sel]))
+        return (float(us.mean()), float(vs.mean()),
+                float(np.median(depth[sel])), int(mask.sum())), d.max()
 
 
 def _kabsch(P, Q):
@@ -129,14 +137,12 @@ def _kabsch(P, Q):
 
 
 def _solve(samples, Wd, Hd):
-    """在方像素假设下搜 f,配 Kabsch 解 T。返回 (rmse, f, T, 逐点误差)。"""
     Q = np.array([s["base"] for s in samples])
     cx, cy = Wd / 2.0, Hd / 2.0
     best = None
     for f in np.arange(200.0, 1400.0, 0.5):
         P = np.array([[(s["u"] - cx) * s["z"] / f,
-                       (s["v"] - cy) * s["z"] / f,
-                       s["z"]] for s in samples])
+                       (s["v"] - cy) * s["z"] / f, s["z"]] for s in samples])
         R, t = _kabsch(P, Q)
         e = np.linalg.norm((P @ R.T + t) - Q, axis=1)
         rmse = float(np.sqrt((e ** 2).mean()))
@@ -147,10 +153,61 @@ def _solve(samples, Wd, Hd):
     return best
 
 
+def _collect(arm, hub, poses, ref_depth, label, samples):
+    """跑一批位姿,采样并落盘深度图。返回更新后的 ref_depth。"""
+    for i, q in enumerate(poses):
+        logger.info("-" * 68)
+        logger.info("[%s %2d/%d] move_joints %s", label, i + 1, len(poses),
+                    [round(v, 2) for v in q])
+        try:
+            arm.move_joints(q, blocking=True)
+        except Exception as e:
+            logger.warning("     移动失败: %s", str(e)[:90])
+            continue
+        time.sleep(SETTLE_S)
+
+        try:
+            pos, rpy = arm.get_pose()
+        except Exception as e:
+            logger.warning("     读位姿失败: %s", str(e)[:90])
+            continue
+
+        if pos[2] < Z_FLOOR:
+            logger.warning("     末端 Z=%.4f 低于安全下限 %.2f,跳过采样", pos[2], Z_FLOOR)
+            continue
+
+        fr = hub.get_frame("head_depth")
+        if fr is None:
+            logger.warning("     无深度帧")
+            continue
+        depth = fr["array"].copy()
+
+        logger.info("     末端 base=(%.4f, %.4f, %.4f)  rpy=(%.3f, %.3f, %.3f)",
+                    *pos, *rpy)
+
+        np.save(os.path.join(FRAME_DIR, "calib_%s_%02d.npy" % (label, i)), depth)
+
+        if ref_depth is None:
+            ref_depth = depth
+            logger.info("     ← 设为基准帧(home 姿态,手臂不在桌面视野)")
+            continue
+
+        hit, dmax = _find_tool_px(depth, ref_depth)
+        if hit is None:
+            logger.info("     未定位到末端 (最大深度变化 %.4f m,阈值 %.3f)",
+                        dmax, MIN_DEPTH_DELTA)
+            continue
+        u, v, z, area = hit
+        logger.info("     depth_px=(%.1f, %.1f)  z=%.4f m  area=%d px  ✓ 采纳",
+                    u, v, z, area)
+        samples.append({"base": np.array(pos, float), "u": u, "v": v, "z": z})
+    return ref_depth
+
+
 def run():
     _setup_logging()
     logger.info("=" * 68)
-    logger.info("自标定开始 —— 用机械臂当标定靶,解 head→base 外参")
+    logger.info("自标定 v2 —— Y 负侧(桌子方向)采样,带撞桌保护")
     logger.info("=" * 68)
 
     hub = CameraHub(CAMERAS, node_name="self_calib_cam")
@@ -162,55 +219,31 @@ def run():
         hub.shutdown()
         return None
     Hd, Wd = hub.get_frame("head_depth")["array"].shape
-    logger.info("深度图 %dx%d", Wd, Hd)
+    logger.info("深度图 %dx%d;末端 Z 安全下限 %.2f", Wd, Hd, Z_FLOOR)
 
     arm = LinkerArmA7(robot_id=ARM_ID, mode="sim")
-    # sim 模式下返回的是 ArmClient 代理,类常量要从 LinkerArmA7 本身读
-    logger.info("DOF=%s  JOINT_LIMITS=%s",
-                getattr(LinkerArmA7, "DOF", "?"),
-                getattr(LinkerArmA7, "JOINT_LIMITS", "?"))
-
     samples = []
-    prev_depth = None
-    poses = _poses()
-    logger.info("共 %d 个位姿待采集", len(poses))
 
-    for i, q in enumerate(poses):
-        logger.info("-" * 68)
-        logger.info("[%2d/%d] move_joints %s", i + 1, len(poses),
-                    [round(v, 2) for v in q])
+    # ── 阶段一:探测 ────────────────────────────────────────────────
+    logger.info("\n【阶段一】探测 6 点,确认相机能拍到手臂")
+    ref = _collect(arm, hub, _probe_poses(), None, "probe", samples)
+    logger.info("=" * 68)
+    logger.info("探测阶段采到 %d 个样本", len(samples))
+
+    if not samples:
+        logger.error("探测阶段一个都没采到 —— 手臂可能仍在相机视野外。")
+        logger.error("深度图已存 camera_frames/calib_probe_*.npy,可离线分析。")
         try:
-            arm.move_joints(q, blocking=True)
-        except Exception as e:
-            logger.warning("     移动失败,跳过: %s", str(e)[:90])
-            continue
-        time.sleep(SETTLE_S)
+            arm.home(blocking=True)
+            arm.shutdown()
+        except Exception:
+            pass
+        hub.shutdown()
+        return None
 
-        try:
-            pos, rpy = arm.get_pose()
-            angles = arm.get_joint_angles()
-        except Exception as e:
-            logger.warning("     读位姿失败: %s", str(e)[:90])
-            continue
-
-        fr = hub.get_frame("head_depth")
-        depth = fr["array"].copy() if fr else None
-        if depth is None:
-            logger.warning("     无深度帧")
-            continue
-
-        logger.info("     末端 base=(%.4f, %.4f, %.4f)  rpy=(%.3f, %.3f, %.3f)",
-                    *pos, *rpy)
-        logger.info("     关节实际=%s", [round(a, 3) for a in angles])
-
-        hit = _find_tool_px(depth, prev_depth)
-        prev_depth = depth
-        if hit is None:
-            logger.info("     深度差分未定位到末端(首帧或位移过小),跳过")
-            continue
-        u, v, z = hit
-        logger.info("     depth_px=(%.1f, %.1f)  z=%.4f m  ✓ 采纳", u, v, z)
-        samples.append({"base": np.array(pos, float), "u": u, "v": v, "z": z})
+    # ── 阶段二:全量 ────────────────────────────────────────────────
+    logger.info("\n【阶段二】全量采集")
+    _collect(arm, hub, _full_poses(), ref, "full", samples)
 
     try:
         arm.home(blocking=True)
@@ -220,18 +253,21 @@ def run():
     hub.shutdown()
 
     logger.info("=" * 68)
-    logger.info("采集到 %d 个有效样本", len(samples))
+    logger.info("共采集 %d 个有效样本", len(samples))
     if len(samples) < 6:
         logger.error("样本不足(<6),无法可靠标定。")
         return None
 
-    zs = [s["base"][2] for s in samples]
-    logger.info("末端 Z 分布: %.3f ~ %.3f (跨度 %.3f m)  ← 越大越好",
-                min(zs), max(zs), max(zs) - min(zs))
+    for ax, name in enumerate("XYZ"):
+        vals = [s["base"][ax] for s in samples]
+        logger.info("末端 %s 分布: %.3f ~ %.3f (跨度 %.3f m)",
+                    name, min(vals), max(vals), max(vals) - min(vals))
+    logger.info("  ← gt.json 4 点的 Z 跨度仅 0.006m,那是旧标定失准的根源")
 
     rmse, f, T, err = _solve(samples, Wd, Hd)
     logger.info("=" * 68)
-    logger.info("标定结果: f=%.2f   RMSE=%.1f mm    [旧 4 点方案: 43.7mm]", f, rmse * 1000)
+    logger.info("标定结果: f=%.2f   RMSE=%.1f mm    [旧 4 点方案 43.7mm]",
+                f, rmse * 1000)
     for s, e in zip(samples, err):
         logger.info("   base=(%7.4f,%7.4f,%7.4f)  err=%6.1f mm", *s["base"], e * 1000)
 
@@ -244,5 +280,4 @@ def run():
         logger.info("    [%s],", ", ".join("% .8f" % v for v in row))
     logger.info("], dtype=np.float64)")
     logger.info("=" * 68)
-    logger.info("完整日志: %s", LOG_PATH)
     return T
