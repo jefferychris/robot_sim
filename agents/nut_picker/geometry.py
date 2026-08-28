@@ -53,6 +53,8 @@ def pixel_to_base(
     intrinsics: dict,
     head_to_base_T: np.ndarray,
     table_z_fallback_m: float = 0.02,
+    depth_scale: float = 1.0,
+    fixed_z: Optional[float] = None,
 ) -> Optional[Tuple[float, float, float]]:
     """像素 → base_link XYZ。
 
@@ -63,6 +65,10 @@ def pixel_to_base(
         intrinsics:             {"fx","fy","cx","cy"}
         head_to_base_T:         4×4 numpy 矩阵(camera→base)
         table_z_fallback_m:     深度缺失时使用的 Z
+        depth_scale:            深度缩放校正系数(相机系统性偏大时 <1)
+        fixed_z:                非 None 时,直接用它覆盖反投影出的 base-Z。
+                                螺母都在同一桌面上,Z 是常数;实测真值 ≈ -0.47,
+                                比深度反投影(误差 4-10mm)更准。视觉只负责 XY。
 
     返回:(x, y, z) 或 None(若 RGB 像素越界)。
     """
@@ -89,6 +95,8 @@ def pixel_to_base(
         logger.debug(
             f"[geom] depth 缺失/无效,使用 fallback Z={z}m at ({u_rgb:.1f},{v_rgb:.1f})"
         )
+    elif depth_scale != 1.0:
+        z = z * depth_scale
 
     # 针孔反投影(camera frame)
     x_cam = (u_d - cx) * z / fx
@@ -97,4 +105,14 @@ def pixel_to_base(
 
     # camera → base
     p_base = head_to_base_T @ p_cam
-    return float(p_base[0]), float(p_base[1]), float(p_base[2])
+    x_base, y_base, z_base = float(p_base[0]), float(p_base[1]), float(p_base[2])
+
+    # 桌面高度写死:XY 用视觉,Z 用已知常数(免掉深度噪声)
+    if fixed_z is not None:
+        logger.debug(
+            f"[geom] Z 固定: 反投影 {z_base:.4f} → {fixed_z:.4f} "
+            f"(Δ={z_base - fixed_z:+.4f}m) at ({u_rgb:.1f},{v_rgb:.1f})"
+        )
+        z_base = fixed_z
+
+    return x_base, y_base, z_base

@@ -1,83 +1,107 @@
-"""用 pose_check 探明工作空间边界 —— 只查询 IK,不驱动机械臂。
+"""工作空间探测：用 arm.pose_check() 批量预检可达性。
 
-背景:config 里 APPROACH/GRASP/PLACE 全被压到 0,是为了绕开 out_of_workspace。
-但这样 approach 点和抓取点重合,pick 没有垂直下压、place 不抬升就横移,
-很可能撞翻已放好的螺母。要定出安全的抬升高度,先得知道真实边界在哪。
+背景：move_to 对桌面高度 (z≈-0.47) 报 out_of_workspace，但 move_joints 能到。
+pose_check(x,y,z,roll,pitch,yaw) -> (bool, str) 可以在不动机械臂的前提下预检，
+用它扫出真实的工作空间边界，替代之前反复试 move_to 的做法。
 
-用法:  python tools/probe_workspace.py
+用法（平台终端）：
+    cd /workspace/agent_system && source /opt/rabo-venvs/agent_system/bin/activate
+    python3 tools/probe_workspace.py
 """
 
-import logging
+import math
 import sys
 
-import numpy as np
-
-logging.basicConfig(level=logging.WARNING)
-
-from agents.nut_picker import config as C
 from rabo_robocap import LinkerArmA7
 
-# 视觉当前解算出的三个螺母 + 箱子位置(base 系)
-TARGETS = {
-    "nut_big":    (-0.305, -0.067, 0.284),
-    "nut_medium": (-0.314, -0.168, 0.278),
-    "nut_small":  (-0.253, -0.090, 0.288),
-    "box":        (-0.385,  0.223, 0.289),
-}
+ARM_ID = "r412d237980e3167577d7aece10f7aedb"
+
+# 三颗螺母 + 三个格子的实测目标位置（SDK 坐标）
+TARGETS = [
+    ("nut_big",    0.388, 0.060, -0.472),
+    ("nut_medium", 0.338, 0.169, -0.467),
+    ("nut_small",  0.447, 0.102, -0.472),
+]
+
+# 俯视抓取姿态
+RPY = (0.0, math.pi, 0.0)
+
+
+def check(arm, label, x, y, z, rpy=RPY):
+    roll, pitch, yaw = rpy
+    try:
+        ok, msg = arm.pose_check(x, y, z, roll, pitch, yaw)
+    except Exception as e:
+        return False, f"EXC {e}"
+    return ok, msg
 
 
 def main():
-    arm = LinkerArmA7(robot_id=C.LEFT_ARM_ID, mode=C.ARM_MODE)
-
-    def ok(x, y, z):
-        try:
-            r = arm.pose_check(x, y, z, roll=C.GRIPPER_ROLL,
-                               pitch=C.GRIPPER_PITCH, yaw=C.GRIPPER_YAW)
-            return bool(r[0] if isinstance(r, (tuple, list)) else r)
-        except Exception:
-            return False
-
-    print("=" * 66)
-    print("[1] 每个目标点的可达 Z 区间(步进 1cm)")
-    print("=" * 66)
-    for name, (x, y, z0) in TARGETS.items():
-        zs = [round(z, 3) for z in np.arange(0.10, 0.61, 0.01) if ok(x, y, round(z, 3))]
-        if zs:
-            print("%12s (x=%.3f y=%.3f)  可达 Z: %.2f ~ %.2f m   视觉 Z=%.3f %s"
-                  % (name, x, y, min(zs), max(zs), z0,
-                     "✓在区间内" if min(zs) <= z0 <= max(zs) else "✗超出区间"))
-            print("%12s   → 该点之上还有 %.0f mm 余量" % ("", (max(zs) - z0) * 1000))
-        else:
-            print("%12s (x=%.3f y=%.3f)  ✗ 整条 Z 轴都不可达" % (name, x, y))
-
+    print("初始化右臂 ...")
+    arm = LinkerArmA7(robot_id=ARM_ID, mode="sim")
+    print("当前关节角:", arm.get_joint_angles())
+    print("当前末端位姿:", arm.get_pose())
     print()
-    print("=" * 66)
-    print("[2] 抬升高度可行性:每个目标能否 approach 到 z+h")
-    print("=" * 66)
-    print("%12s %s" % ("target", "  ".join("+%dcm" % int(h * 100) for h in
-                                           (0.02, 0.05, 0.08, 0.10, 0.15))))
-    for name, (x, y, z0) in TARGETS.items():
-        marks = ["  ✓  " if ok(x, y, z0 + h) else "  ✗  "
-                 for h in (0.02, 0.05, 0.08, 0.10, 0.15)]
-        print("%12s %s" % (name, " ".join(marks)))
 
+    # ── 1. 直接检目标点 ────────────────────────────────────────────
+    print("=" * 64)
+    print("1) 目标点可达性（俯视姿态 pitch=pi）")
+    print("=" * 64)
+    for label, x, y, z in TARGETS:
+        ok, msg = check(arm, label, x, y, z)
+        print(f"  {label:12s} ({x:.3f}, {y:.3f}, {z:.3f})  ->  {ok}  {msg}")
     print()
-    print("=" * 66)
-    print("[3] XY 平面扫描 @ Z=0.28(视觉平面),看整体可达范围")
-    print("=" * 66)
-    xs = np.arange(-0.50, -0.09, 0.05)
-    ys = np.arange(-0.30, 0.31, 0.05)
-    print("      " + "".join("%6.2f" % y for y in ys))
+
+    # ── 2. 目标点上方不同高度 ──────────────────────────────────────
+    print("=" * 64)
+    print("2) 沿 Z 扫描（找可达的最低高度 = 能否够到桌面）")
+    print("=" * 64)
+    for label, x, y, _z in TARGETS:
+        line = [f"  {label:12s}"]
+        for z in [-0.50, -0.45, -0.40, -0.30, -0.20, -0.10, 0.0, 0.1, 0.2, 0.3]:
+            ok, _ = check(arm, label, x, y, z)
+            line.append(f"{z:+.2f}:{'Y' if ok else '.'}")
+        print(" ".join(line))
+    print()
+
+    # ── 3. 换姿态再试目标点 ────────────────────────────────────────
+    print("=" * 64)
+    print("3) 不同抓取姿态下的目标点可达性")
+    print("=" * 64)
+    poses = [
+        ("俯视 pitch=pi",      (0.0, math.pi, 0.0)),
+        ("俯视 pitch=-pi/2",   (0.0, -math.pi / 2, 0.0)),
+        ("俯视 pitch=pi/2",    (0.0, math.pi / 2, 0.0)),
+        ("水平 pitch=0",       (0.0, 0.0, 0.0)),
+        ("俯视+yaw90",         (0.0, math.pi, math.pi / 2)),
+        ("斜 45°",             (0.0, math.pi * 0.75, 0.0)),
+    ]
+    for pname, rpy in poses:
+        res = []
+        for label, x, y, z in TARGETS:
+            ok, _ = check(arm, label, x, y, z, rpy)
+            res.append(f"{label.split('_')[1][:3]}:{'Y' if ok else '.'}")
+        print(f"  {pname:20s} " + "  ".join(res))
+    print()
+
+    # ── 4. XY 平面粗扫（固定桌面高度）─────────────────────────────
+    print("=" * 64)
+    print("4) XY 平面可达域（z=-0.47 桌面高度，俯视姿态）")
+    print("=" * 64)
+    zs = -0.47
+    ys = [round(-0.1 + 0.05 * i, 2) for i in range(9)]   # -0.10 .. 0.30
+    xs = [round(0.20 + 0.05 * i, 2) for i in range(9)]   # 0.20 .. 0.60
+    print("       " + " ".join(f"{y:+.2f}" for y in ys))
     for x in xs:
-        row = "".join("     %s" % ("#" if ok(round(x, 3), round(y, 3), 0.28) else ".")
-                      for y in ys)
-        print("%6.2f%s" % (x, row))
-    print("\n(# = 可达, . = 不可达; 行=X, 列=Y)")
+        row = [f"x={x:.2f}"]
+        for y in ys:
+            ok, _ = check(arm, "scan", x, y, zs)
+            row.append("  Y  " if ok else "  .  ")
+        print(" ".join(row))
+    print()
+    print("(Y=可达  .=不可达)")
 
-    try:
-        arm.shutdown()
-    except Exception:
-        pass
+    arm.shutdown()
 
 
 if __name__ == "__main__":

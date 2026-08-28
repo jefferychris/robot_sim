@@ -24,7 +24,7 @@ import time
 import numpy as np
 
 from drivers.camera import CameraHub
-from rabo_robocap import LinkerArmA7, LinkerHandO6Left
+from rabo_robocap import LinkerArmA7, LinkerHandO6Right
 
 from . import config
 from . import detector
@@ -145,13 +145,15 @@ def run():
             *nut["centroid_px"], rgb_shape=rgb_shape, depth=depth,
             intrinsics=config.HEAD_CAMERA_INTRINSICS,
             head_to_base_T=config.HEAD_TO_BASE_T,
-            table_z_fallback_m=config.TABLE_Z_FALLBACK_M,
+            table_z_fallback_m=config.TABLE_Z_FALLBACK_M, depth_scale=config.DEPTH_SCALE_CORRECTION,
+            fixed_z=config.TABLE_Z_M if config.USE_FIXED_TABLE_Z else None,
         )
         c_xyz = geometry.pixel_to_base(
             *cell["centroid_px"], rgb_shape=rgb_shape, depth=depth,
             intrinsics=config.HEAD_CAMERA_INTRINSICS,
             head_to_base_T=config.HEAD_TO_BASE_T,
-            table_z_fallback_m=config.TABLE_Z_FALLBACK_M,
+            table_z_fallback_m=config.TABLE_Z_FALLBACK_M, depth_scale=config.DEPTH_SCALE_CORRECTION,
+            fixed_z=config.TABLE_Z_M if config.USE_FIXED_TABLE_Z else None,
         )
         if n_xyz is None or c_xyz is None:
             logger.error(f"[nut_picker] 反投影失败: nut={nut['label']} cell={cell['index']}")
@@ -164,8 +166,8 @@ def run():
         )
 
     # ── 5. 执行抓放 ─────────────────────────────────────────────────
-    arm = LinkerArmA7(robot_id=config.LEFT_ARM_ID, mode=config.ARM_MODE)
-    hand = LinkerHandO6Left(robot_id=config.LEFT_HAND_ID, mode=config.HAND_MODE)
+    arm = LinkerArmA7(robot_id=config.RIGHT_ARM_ID, mode=config.ARM_MODE)
+    hand = LinkerHandO6Right(robot_id=config.RIGHT_HAND_ID, mode=config.HAND_MODE)
     runner = motion_module.PickPlaceRunner(arm, hand, config)
 
     try:

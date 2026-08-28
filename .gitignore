@@ -32,3 +32,6 @@ node_modules/
 # Logs / 临时
 *.log
 *.tmp
+
+# 云端同步镜像(本地缓存,非源码)
+remote_sync/
